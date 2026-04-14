@@ -1,0 +1,22 @@
+debug/
+
+run.sh
+
+# Build
+target/
+
+# Credentials
+creds.json
+mqtt-creds.json
+
+
+# Environment
+.direnv/
+
+# Python remnants
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.venv/
