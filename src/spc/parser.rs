@@ -72,13 +72,18 @@ pub fn parse_areas(html: &str) -> Vec<ParsedArea> {
             continue;
         }
 
-        // Look for "Area N: Name" in any cell
+        // Look for "Area N: Name" or "All Areas" in cells
         let mut area_id = None;
         let mut area_name = String::new();
+        let mut is_all_areas = false;
         for cell in &cells {
             let text = cell.text().collect::<String>();
             let text = text.trim();
-            if let Some(rest) = text.strip_prefix("Area ") {
+            if text == "All Areas" {
+                area_id = Some(0u32);
+                area_name = "All Areas".to_string();
+                is_all_areas = true;
+            } else if let Some(rest) = text.strip_prefix("Area ") {
                 if let Some((id_str, name)) = rest.split_once(':') {
                     if let Ok(id) = id_str.trim().parse::<u32>() {
                         area_id = Some(id);
@@ -108,12 +113,16 @@ pub fn parse_areas(html: &str) -> Vec<ParsedArea> {
         for input in row.select(&input_sel) {
             let name = input.value().attr("name").unwrap_or("");
             let value = input.value().attr("value").unwrap_or("").trim();
-            // Only area-specific buttons (fullset_area, partset_*, unset_area)
-            if !name.is_empty()
-                && !value.is_empty()
-                && (name.contains("set") || name.contains("unset"))
-                && name.contains(&format!("area{id}"))
-            {
+            if name.is_empty() || value.is_empty() {
+                continue;
+            }
+            let matches = if is_all_areas {
+                name.contains("all_areas")
+            } else {
+                (name.contains("set") || name.contains("unset"))
+                    && name.contains(&format!("area{id}"))
+            };
+            if matches {
                 actions.push(AreaAction {
                     label: value.to_string(),
                     form_name: name.to_string(),

@@ -40,7 +40,7 @@ pub async fn run(config: &Config, mut spc: SpcClient) {
     loop {
         let mut discovered: HashSet<String> = HashSet::new();
 
-        let client_id = format!("spc_mqtt_{}", state.serial);
+        let client_id = format!("spc_mqtt_{}_{}", state.serial, std::process::id());
         let mut opts = MqttOptions::new(&client_id, &config.mqtt_host, config.mqtt_port);
         opts.set_keep_alive(Duration::from_secs(30));
         if let Some(creds) = &config.mqtt_creds {
@@ -415,15 +415,28 @@ async fn handle_command(
                 .get(area_id)
                 .and_then(|area| {
                     if area.state == *label {
+                        info!("Area {area_id} already in state {label:?}, skipping");
                         return None;
                     }
+                    // First check parsed action buttons (covers all cases including "all_areas")
+                    if let Some(action) = area.actions.iter().find(|a| a.label == *label) {
+                        return Some(action.form_name.clone());
+                    }
+                    // "Unset" may not appear as a button when already unset —
+                    // construct the form name from the existing button naming pattern
                     if label == "Unset" {
+                        // Derive pattern from existing actions: "fullset_all_areas" → "unset_all_areas"
+                        if let Some(action) = area.actions.first() {
+                            if let Some(suffix) = action.form_name.strip_prefix("fullset_")
+                                .or_else(|| action.form_name.strip_prefix("partset_a_"))
+                                .or_else(|| action.form_name.strip_prefix("partset_b_"))
+                            {
+                                return Some(format!("unset_{suffix}"));
+                            }
+                        }
                         return Some(format!("unset_area{area_id}"));
                     }
-                    area.actions
-                        .iter()
-                        .find(|a| a.label == *label)
-                        .map(|a| a.form_name.clone())
+                    None
                 });
             let Some(name) = form_name else {
                 warn!("No action for area {area_id} label {label:?}");
