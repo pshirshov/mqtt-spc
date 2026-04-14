@@ -29,7 +29,6 @@
           pname = "spc-mqtt";
           version = "0.1.0";
           src = ./.;
-          useFetchCargoVendor = true;
           cargoHash = "sha256-Vo2HKwDtXBkNWjbZT7ZG+qUt8OCWOLeHsYyEpYCXtEg=";
         };
       });
