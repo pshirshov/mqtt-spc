@@ -18,6 +18,7 @@ enum Command {
     Area { area_id: u32, label: String },
     Zone { zone_id: u32, action: String },
     Alert { sensor_id: String, action: String },
+    Rediscover,
 }
 
 pub async fn run(config: &Config, mut spc: SpcClient) {
@@ -92,9 +93,13 @@ async fn run_session(
     state: &mut PanelState,
     discovered: &mut HashSet<String>,
 ) -> Result<(), BoxError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        if let rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_)) = eventloop.poll().await? {
-            break;
+        match tokio::time::timeout_at(deadline, eventloop.poll()).await {
+            Ok(Ok(rumqttc::Event::Incoming(rumqttc::Packet::ConnAck(_)))) => break,
+            Ok(Ok(_)) => continue,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Err("Timed out waiting for MQTT ConnAck".into()),
         }
     }
 
@@ -124,11 +129,18 @@ async fn run_session(
     client
         .subscribe(format!("{prefix}/alert/+/action"), QoS::AtLeastOnce)
         .await?;
+    client
+        .subscribe(
+            format!("{}/status", config.discovery_prefix),
+            QoS::AtLeastOnce,
+        )
+        .await?;
 
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<Command>(16);
     let prefix_owned = prefix.to_string();
+    let discovery_prefix_owned = config.discovery_prefix.to_string();
     let eventloop_handle = tokio::spawn(async move {
-        drive_eventloop(eventloop, cmd_tx, &prefix_owned).await;
+        drive_eventloop(eventloop, cmd_tx, &prefix_owned, &discovery_prefix_owned).await;
     });
 
     if let Err(e) = poll_and_publish(config, client, spc, state, discovered).await {
@@ -148,6 +160,21 @@ async fn run_session(
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
+                    Some(Command::Rediscover) => {
+                        discovered.clear();
+                        let ctx = make_ctx(&state.name, &state.serial, config);
+                        if let Err(e) = client.publish(
+                            ha::event_sensor_discovery_topic(&ctx),
+                            QoS::AtLeastOnce,
+                            true,
+                            ha::event_sensor_discovery_payload(&ctx),
+                        ).await {
+                            warn!("Event sensor re-discovery failed: {e}");
+                        }
+                        if let Err(e) = poll_and_publish(config, client, spc, state, discovered).await {
+                            warn!("Re-discovery poll failed: {e}");
+                        }
+                    }
                     Some(cmd) => {
                         handle_command(config, client, spc, state, discovered, cmd).await;
                     }
@@ -165,10 +192,12 @@ async fn drive_eventloop(
     mut eventloop: EventLoop,
     cmd_tx: mpsc::Sender<Command>,
     prefix: &str,
+    discovery_prefix: &str,
 ) {
     let area_prefix = format!("{prefix}/area/");
     let zone_prefix = format!("{prefix}/zone/");
     let alert_prefix = format!("{prefix}/alert/");
+    let ha_status_topic = format!("{discovery_prefix}/status");
 
     loop {
         match eventloop.poll().await {
@@ -176,7 +205,10 @@ async fn drive_eventloop(
                 let topic = &p.topic;
                 let payload = String::from_utf8_lossy(&p.payload).to_string();
 
-                let cmd = if let Some(rest) = topic.strip_prefix(&area_prefix) {
+                let cmd = if *topic == ha_status_topic && payload == "online" {
+                    info!("Home Assistant birth message received, re-publishing discovery");
+                    Some(Command::Rediscover)
+                } else if let Some(rest) = topic.strip_prefix(&area_prefix) {
                     rest.strip_suffix("/set").and_then(|id| {
                         id.parse::<u32>().ok().map(|area_id| {
                             info!("Command: area {area_id} = {payload}");
@@ -409,6 +441,7 @@ async fn handle_command(
     cmd: Command,
 ) {
     let (button, page) = match &cmd {
+        Command::Rediscover => unreachable!("handled in run_session"),
         Command::Area { area_id, label } => {
             let form_name = state
                 .areas
