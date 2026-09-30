@@ -283,6 +283,10 @@ pub struct Zone {
     pub zone_type: Option<ZoneType>,
     pub input: ZoneInput,
     pub status: ZoneStatus,
+    /// Whether the zone supports inhibit/isolate. The panel's
+    /// INHIBIT_ALLOWED/ISOLATE_ALLOWED only say whether the operation is
+    /// possible *now* (both drop to 0 while the zone is bypassed), so a
+    /// capability once seen is kept, and an active bypass implies it.
     pub inhibit_allowed: bool,
     pub isolate_allowed: bool,
 }
@@ -418,12 +422,21 @@ impl Snapshot {
     }
 
     pub fn apply_zones(&mut self, reply: &XmlReply) {
+        let previous = std::mem::take(&mut self.zones);
         self.zones = reply
             .rows("ZONE_STATUS")
             .iter()
             .filter_map(|row| {
                 let id = parse_id::<u32>(row, "zone")?;
                 let get = |k: &str| row.get(k).map(String::as_str).unwrap_or_default();
+                let status = ZoneStatus::from_token(get("STATUS"));
+                let prev = previous.get(&id);
+                let inhibit_allowed = get("INHIBIT_ALLOWED") == "1"
+                    || status == ZoneStatus::Inhibited
+                    || prev.is_some_and(|z| z.inhibit_allowed);
+                let isolate_allowed = get("ISOLATE_ALLOWED") == "1"
+                    || status == ZoneStatus::Isolated
+                    || prev.is_some_and(|z| z.isolate_allowed);
                 Some((
                     id,
                     Zone {
@@ -432,9 +445,9 @@ impl Snapshot {
                         area_id: get("AREA").parse().unwrap_or(0),
                         zone_type: ZoneType::from_token(get("TYPE")),
                         input: ZoneInput::from_token(get("INPUT")),
-                        status: ZoneStatus::from_token(get("STATUS")),
-                        inhibit_allowed: get("INHIBIT_ALLOWED") == "1",
-                        isolate_allowed: get("ISOLATE_ALLOWED") == "1",
+                        status,
+                        inhibit_allowed,
+                        isolate_allowed,
                     },
                 ))
             })
@@ -562,6 +575,26 @@ mod tests {
         assert_eq!(unknown.unmapped_active(), vec![30]);
         let bad = parse_reply(br#"<COMMAND_REPLY><SYSALERT INPUT="zz" /></COMMAND_REPLY>"#).unwrap();
         assert!(s.apply_status(&bad).is_err());
+    }
+
+    fn zones(xml: &str) -> XmlReply {
+        parse_reply(format!("<COMMAND_REPLY><ZONE_STATUS>{xml}</ZONE_STATUS></COMMAND_REPLY>").as_bytes())
+            .unwrap()
+    }
+
+    // The panel clears INHIBIT_ALLOWED while a zone is inhibited (observed
+    // live); the control must stay available so it can be switched back.
+    #[test]
+    fn bypass_controls_stay_available_while_active() {
+        let mut s = Snapshot::default();
+        s.apply_zones(&zones(r#"<ZONE ID="5" STATUS="0" INHIBIT_ALLOWED="1" ISOLATE_ALLOWED="1" />"#));
+        s.apply_zones(&zones(r#"<ZONE ID="5" STATUS="1" INHIBIT_ALLOWED="0" ISOLATE_ALLOWED="0" />"#));
+        assert!(s.zones[&5].inhibit_allowed && s.zones[&5].isolate_allowed);
+
+        // Bridge started while the zone was already isolated.
+        let mut fresh = Snapshot::default();
+        fresh.apply_zones(&zones(r#"<ZONE ID="5" STATUS="2" INHIBIT_ALLOWED="0" ISOLATE_ALLOWED="0" />"#));
+        assert!(fresh.zones[&5].isolate_allowed && !fresh.zones[&5].inhibit_allowed);
     }
 
     #[test]
