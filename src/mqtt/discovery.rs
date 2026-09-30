@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{json, Value};
 
+use crate::config::ModeNames;
 use crate::edp::panel::{Area, PanelInfo, SYSTEM_ALERTS, Snapshot, Zone, ZoneStatus};
 
 /// Panel identity, passed through to all discovery payloads.
@@ -64,6 +65,7 @@ pub fn discovery_messages(
     snapshot: &Snapshot,
     ctx: &Ctx,
     zone_classes: &HashMap<u32, String>,
+    mode_names: &ModeNames,
 ) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     out.insert(event_sensor_discovery_topic(ctx), event_sensor_discovery_payload(ctx));
@@ -76,6 +78,10 @@ pub fn discovery_messages(
     );
     for area in snapshot.areas.values() {
         out.insert(area_discovery_topic(area, ctx), area_discovery_payload(area, ctx));
+        out.insert(
+            area_mode_discovery_topic(area, ctx),
+            area_mode_discovery_payload(area, mode_names, ctx),
+        );
         out.insert(legacy_topic(ctx, "select", &format!("area_{}", area.id)), String::new());
     }
     for zone in snapshot.zones.values() {
@@ -230,6 +236,34 @@ fn alert_discovery_payload(slug: &str, name: &str, ctx: &Ctx) -> String {
 }
 
 // --- Areas (alarm_control_panel) ---
+
+// --- Area mode with the panel's names (select) ---
+
+fn area_mode_discovery_topic(area: &Area, ctx: &Ctx) -> String {
+    format!("{}/select/{}/area_{}_mode/config", ctx.discovery_prefix, node_id(ctx), area.id)
+}
+
+fn area_mode_discovery_payload(area: &Area, mode_names: &ModeNames, ctx: &Ctx) -> String {
+    let prefix = ctx.topic_prefix;
+    let area_name = if area.name.is_empty() {
+        format!("Area {}", area.id)
+    } else {
+        area.name.clone()
+    };
+    let options: Vec<&str> = ModeNames::ORDER.iter().map(|&m| mode_names.label(m)).collect();
+    let mut payload = json!({
+        "name": format!("{area_name} Mode"),
+        "unique_id": format!("spc_{}_area_{}_mode", ctx.info.serial, area.id),
+        "state_topic": format!("{prefix}/area/{}/mode", area.id),
+        "command_topic": format!("{prefix}/area/{}/mode/set", area.id),
+        "options": options,
+        "icon": "mdi:shield-home",
+        "device": device_info(ctx),
+    });
+    merge(&mut payload, &availability(ctx));
+
+    payload.to_string()
+}
 
 fn area_discovery_topic(area: &Area, ctx: &Ctx) -> String {
     format!(

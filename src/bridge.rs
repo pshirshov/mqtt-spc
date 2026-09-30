@@ -6,7 +6,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, ModeNames};
 use crate::edp::panel::{
     Area, ArmMode, PanelInfo, QUERY_AREAS, QUERY_INFO, QUERY_STATUS, QUERY_ZONES,
     SYSTEM_ALERTS, Snapshot, Zone,
@@ -25,17 +25,35 @@ enum MqttEvent {
     Disconnected,
     HomeAssistantOnline,
     AreaCommand { area_id: u8, payload: String },
+    AreaModeCommand { area_id: u8, payload: String },
     ZoneCommand { zone_id: u8, control: ZoneControl, payload: String },
 }
 
 /// Home Assistant alarm_control_panel command payloads.
-fn area_op(payload: &str) -> Option<BinaryOp> {
+fn alarm_panel_mode(payload: &str) -> Option<ArmMode> {
     match payload {
-        "DISARM" => Some(BinaryOp::AreaUnset),
-        "ARM_HOME" => Some(BinaryOp::AreaPartSetA),
-        "ARM_NIGHT" => Some(BinaryOp::AreaPartSetB),
-        "ARM_AWAY" => Some(BinaryOp::AreaFullSet),
+        "DISARM" => Some(ArmMode::Unset),
+        "ARM_HOME" => Some(ArmMode::PartSetA),
+        "ARM_NIGHT" => Some(ArmMode::PartSetB),
+        "ARM_AWAY" => Some(ArmMode::FullSet),
         _ => None,
+    }
+}
+
+fn arm_op(mode: ArmMode) -> BinaryOp {
+    match mode {
+        ArmMode::Unset => BinaryOp::AreaUnset,
+        ArmMode::PartSetA => BinaryOp::AreaPartSetA,
+        ArmMode::PartSetB => BinaryOp::AreaPartSetB,
+        ArmMode::FullSet => BinaryOp::AreaFullSet,
+    }
+}
+
+/// Select state: the panel's name for the mode.
+fn area_mode_label<'a>(area: &Area, names: &'a ModeNames) -> &'a str {
+    match area.mode {
+        Some(mode) => names.label(mode),
+        None => "None",
     }
 }
 
@@ -256,6 +274,7 @@ impl Bridge<'_> {
                 let prefix = &self.config.topic_prefix;
                 for topic in [
                     format!("{prefix}/area/+/set"),
+                    format!("{prefix}/area/+/mode/set"),
                     format!("{prefix}/zone/+/+/set"),
                     format!("{}/status", self.config.discovery_prefix),
                 ] {
@@ -272,13 +291,12 @@ impl Bridge<'_> {
                 self.publish_all().await;
             }
             MqttEvent::AreaCommand { area_id, payload } => {
-                let Some(op) = area_op(&payload) else {
-                    warn!("Unsupported command {payload:?} for area {area_id}");
-                    return;
-                };
-                self.command(op, area_id, &format!("Area {area_id} {payload}")).await;
-                self.reread(QUERY_AREAS).await;
-                self.publish_area(area_id).await;
+                let mode = alarm_panel_mode(&payload);
+                self.area_command(area_id, mode, &payload).await;
+            }
+            MqttEvent::AreaModeCommand { area_id, payload } => {
+                let mode = self.config.mode_names.mode(&payload);
+                self.area_command(area_id, mode, &payload).await;
             }
             MqttEvent::ZoneCommand { zone_id, control, payload } => {
                 let Some(op) = zone_op(control, &payload) else {
@@ -290,6 +308,16 @@ impl Bridge<'_> {
                 self.publish_zone(u32::from(zone_id)).await;
             }
         }
+    }
+
+    async fn area_command(&mut self, area_id: u8, mode: Option<ArmMode>, payload: &str) {
+        let Some(mode) = mode else {
+            warn!("Unsupported command {payload:?} for area {area_id}");
+            return;
+        };
+        self.command(arm_op(mode), area_id, &format!("Area {area_id} {payload}")).await;
+        self.reread(QUERY_AREAS).await;
+        self.publish_area(area_id).await;
     }
 
     /// Send a binary command; a failure is logged and surfaced on the event
@@ -354,7 +382,12 @@ impl Bridge<'_> {
             topic_prefix: &self.config.topic_prefix,
             discovery_prefix: &self.config.discovery_prefix,
         };
-        let desired = ha::discovery_messages(&loaded.snapshot, &ctx, &self.config.zone_device_class);
+        let desired = ha::discovery_messages(
+            &loaded.snapshot,
+            &ctx,
+            &self.config.zone_device_class,
+            &self.config.mode_names,
+        );
         let removed: Vec<String> =
             self.discovery.keys().filter(|t| !desired.contains_key(*t)).cloned().collect();
         for topic in removed {
@@ -412,6 +445,8 @@ impl Bridge<'_> {
         let Some(area) = self.loaded().and_then(|l| l.snapshot.areas.get(&id)) else { return };
         let prefix = &self.config.topic_prefix;
         self.publish(format!("{prefix}/area/{id}/state"), true, area_state(area).into()).await;
+        let label = area_mode_label(area, &self.config.mode_names);
+        self.publish(format!("{prefix}/area/{id}/mode"), true, label.into()).await;
     }
 
     async fn publish_zone(&self, id: u32) {
@@ -462,13 +497,7 @@ async fn drive_eventloop(
                     .strip_prefix(&area_prefix)
                     .and_then(|rest| rest.strip_suffix("/set"))
                 {
-                    match id.parse::<u8>() {
-                        Ok(area_id) => Some(MqttEvent::AreaCommand { area_id, payload }),
-                        Err(_) => {
-                            warn!("Ignoring command for invalid area {id:?}");
-                            None
-                        }
-                    }
+                    parse_area_command(id, payload)
                 } else if let Some(rest) = p
                     .topic
                     .strip_prefix(&zone_prefix)
@@ -504,6 +533,22 @@ fn parse_zone_command(rest: &str, payload: String) -> Option<MqttEvent> {
         (Ok(zone_id), Some(control)) => Some(MqttEvent::ZoneCommand { zone_id, control, payload }),
         _ => {
             warn!("Ignoring zone command on unrecognised topic suffix {rest:?}");
+            None
+        }
+    }
+}
+
+/// `<area id>` (alarm panel) or `<area id>/mode` (select) from a `.../area/…/set` topic.
+fn parse_area_command(rest: &str, payload: String) -> Option<MqttEvent> {
+    let (id, is_mode) = match rest.strip_suffix("/mode") {
+        Some(id) => (id, true),
+        None => (rest, false),
+    };
+    match id.parse::<u8>() {
+        Ok(area_id) if is_mode => Some(MqttEvent::AreaModeCommand { area_id, payload }),
+        Ok(area_id) => Some(MqttEvent::AreaCommand { area_id, payload }),
+        Err(_) => {
+            warn!("Ignoring area command on unrecognised topic suffix {rest:?}");
             None
         }
     }

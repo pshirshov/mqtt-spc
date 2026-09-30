@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::edp::panel::ArmMode;
 use crate::edp::session::ReceiverConfig;
 use crate::edp::wire::EdpKey;
 
@@ -51,6 +52,14 @@ pub struct Args {
     #[arg(long, default_value = "homeassistant")]
     pub discovery_prefix: String,
 
+    /// Panel's name for part set A (its web UI shows it on the set buttons)
+    #[arg(long, default_value = "Part Set A")]
+    pub part_set_a_name: String,
+
+    /// Panel's name for part set B
+    #[arg(long, default_value = "Part Set B")]
+    pub part_set_b_name: String,
+
     /// Zone device class overrides (e.g. 1=door 2=motion)
     #[arg(long = "zone-class", value_parser = parse_zone_class)]
     pub zone_classes: Vec<(u32, String)>,
@@ -79,6 +88,46 @@ impl Credentials {
     }
 }
 
+/// Display labels for the arm modes. EDP reports only the mode number; the
+/// panel's part-set names are not available over it, so they are configured.
+#[derive(Debug, Clone)]
+pub struct ModeNames {
+    part_set_a: String,
+    part_set_b: String,
+}
+
+impl ModeNames {
+    const UNSET: &str = "Unset";
+    const FULL_SET: &str = "Fullset";
+    pub const ORDER: [ArmMode; 4] =
+        [ArmMode::Unset, ArmMode::PartSetA, ArmMode::PartSetB, ArmMode::FullSet];
+
+    pub fn label(&self, mode: ArmMode) -> &str {
+        match mode {
+            ArmMode::Unset => Self::UNSET,
+            ArmMode::PartSetA => &self.part_set_a,
+            ArmMode::PartSetB => &self.part_set_b,
+            ArmMode::FullSet => Self::FULL_SET,
+        }
+    }
+
+    fn from_args(part_set_a: String, part_set_b: String) -> Self {
+        let names = Self { part_set_a, part_set_b };
+        let labels: Vec<&str> = Self::ORDER.iter().map(|&m| names.label(m)).collect();
+        for (i, label) in labels.iter().enumerate() {
+            assert!(
+                !label.is_empty() && !labels[..i].contains(label),
+                "arm mode names must be non-empty and distinct: {labels:?}"
+            );
+        }
+        names
+    }
+
+    pub fn mode(&self, label: &str) -> Option<ArmMode> {
+        Self::ORDER.into_iter().find(|&m| self.label(m) == label)
+    }
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub receiver: ReceiverConfig,
@@ -89,6 +138,7 @@ pub struct Config {
     pub topic_prefix: String,
     pub discovery_prefix: String,
     pub zone_device_class: HashMap<u32, String>,
+    pub mode_names: ModeNames,
 }
 
 impl Config {
@@ -120,6 +170,28 @@ impl Config {
             topic_prefix: args.topic_prefix,
             discovery_prefix: args.discovery_prefix,
             zone_device_class: args.zone_classes.into_iter().collect(),
+            mode_names: ModeNames::from_args(args.part_set_a_name, args.part_set_b_name),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode_names_round_trip() {
+        let names = ModeNames::from_args("Ground Floor".into(), "All but access".into());
+        for mode in ModeNames::ORDER {
+            assert_eq!(names.mode(names.label(mode)), Some(mode));
+        }
+        assert_eq!(names.label(ArmMode::PartSetA), "Ground Floor");
+        assert_eq!(names.mode("ARM_AWAY"), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "distinct")]
+    fn mode_names_must_be_distinct() {
+        ModeNames::from_args("Fullset".into(), "B".into());
     }
 }
