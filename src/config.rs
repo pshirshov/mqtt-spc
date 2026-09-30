@@ -52,6 +52,10 @@ pub struct Args {
     #[arg(long, default_value = "homeassistant")]
     pub discovery_prefix: String,
 
+    /// Label for the unset mode in the area mode select
+    #[arg(long, default_value = "Unset")]
+    pub unset_name: String,
+
     /// Panel's name for part set A (its web UI shows it on the set buttons)
     #[arg(long, default_value = "Part Set A")]
     pub part_set_a_name: String,
@@ -59,6 +63,10 @@ pub struct Args {
     /// Panel's name for part set B
     #[arg(long, default_value = "Part Set B")]
     pub part_set_b_name: String,
+
+    /// Label for the full set mode in the area mode select
+    #[arg(long, default_value = "Fullset")]
+    pub full_set_name: String,
 
     /// Zone device class overrides (e.g. 1=door 2=motion)
     #[arg(long = "zone-class", value_parser = parse_zone_class)]
@@ -89,30 +97,30 @@ impl Credentials {
 }
 
 /// Display labels for the arm modes. EDP reports only the mode number; the
-/// panel's part-set names are not available over it, so they are configured.
+/// panel's names for the modes are not available over it, so they are configured.
 #[derive(Debug, Clone)]
 pub struct ModeNames {
+    unset: String,
     part_set_a: String,
     part_set_b: String,
+    full_set: String,
 }
 
 impl ModeNames {
-    const UNSET: &str = "Unset";
-    const FULL_SET: &str = "Fullset";
     pub const ORDER: [ArmMode; 4] =
         [ArmMode::Unset, ArmMode::PartSetA, ArmMode::PartSetB, ArmMode::FullSet];
 
     pub fn label(&self, mode: ArmMode) -> &str {
         match mode {
-            ArmMode::Unset => Self::UNSET,
+            ArmMode::Unset => &self.unset,
             ArmMode::PartSetA => &self.part_set_a,
             ArmMode::PartSetB => &self.part_set_b,
-            ArmMode::FullSet => Self::FULL_SET,
+            ArmMode::FullSet => &self.full_set,
         }
     }
 
-    fn from_args(part_set_a: String, part_set_b: String) -> Self {
-        let names = Self { part_set_a, part_set_b };
+    fn from_args(unset: String, part_set_a: String, part_set_b: String, full_set: String) -> Self {
+        let names = Self { unset, part_set_a, part_set_b, full_set };
         let labels: Vec<&str> = Self::ORDER.iter().map(|&m| names.label(m)).collect();
         for (i, label) in labels.iter().enumerate() {
             assert!(
@@ -170,7 +178,12 @@ impl Config {
             topic_prefix: args.topic_prefix,
             discovery_prefix: args.discovery_prefix,
             zone_device_class: args.zone_classes.into_iter().collect(),
-            mode_names: ModeNames::from_args(args.part_set_a_name, args.part_set_b_name),
+            mode_names: ModeNames::from_args(
+                args.unset_name,
+                args.part_set_a_name,
+                args.part_set_b_name,
+                args.full_set_name,
+            ),
         }
     }
 }
@@ -181,17 +194,23 @@ mod tests {
 
     #[test]
     fn mode_names_round_trip() {
-        let names = ModeNames::from_args("Ground Floor".into(), "All but access".into());
+        let names = ModeNames::from_args(
+            "Off".into(),
+            "Ground Floor".into(),
+            "All but access".into(),
+            "Fullset".into(),
+        );
         for mode in ModeNames::ORDER {
             assert_eq!(names.mode(names.label(mode)), Some(mode));
         }
         assert_eq!(names.label(ArmMode::PartSetA), "Ground Floor");
+        assert_eq!(names.label(ArmMode::Unset), "Off");
         assert_eq!(names.mode("ARM_AWAY"), None);
     }
 
     #[test]
     #[should_panic(expected = "distinct")]
     fn mode_names_must_be_distinct() {
-        ModeNames::from_args("Fullset".into(), "B".into());
+        ModeNames::from_args("Unset".into(), "Fullset".into(), "B".into(), "Fullset".into());
     }
 }

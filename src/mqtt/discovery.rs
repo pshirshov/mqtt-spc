@@ -58,6 +58,9 @@ pub const UNMAPPED_ALERT_SLUG: &str = "unmapped_alert";
 /// Discovery topics of entities published by the web-UI-based bridge that
 /// this version no longer provides; an empty retained payload removes them.
 const LEGACY_ZONE_BUTTONS: [&str; 2] = ["inhibit", "isolate"];
+/// Per-area entities of earlier versions: the web-UI select, and the
+/// alarm_control_panel that duplicated the mode select.
+const LEGACY_AREA_COMPONENTS: [&str; 2] = ["select", "alarm_control_panel"];
 
 /// Retained discovery configs for the current snapshot: topic -> payload.
 /// An empty payload deletes the entity in Home Assistant.
@@ -77,12 +80,14 @@ pub fn discovery_messages(
         alert_discovery_payload(UNMAPPED_ALERT_SLUG, "Unmapped System Alert", ctx),
     );
     for area in snapshot.areas.values() {
-        out.insert(area_discovery_topic(area, ctx), area_discovery_payload(area, ctx));
+        out.insert(area_alarm_discovery_topic(area, ctx), area_alarm_discovery_payload(area, ctx));
         out.insert(
             area_mode_discovery_topic(area, ctx),
             area_mode_discovery_payload(area, mode_names, ctx),
         );
-        out.insert(legacy_topic(ctx, "select", &format!("area_{}", area.id)), String::new());
+        for component in LEGACY_AREA_COMPONENTS {
+            out.insert(legacy_topic(ctx, component, &format!("area_{}", area.id)), String::new());
+        }
     }
     for zone in snapshot.zones.values() {
         let class = zone_classes
@@ -235,24 +240,25 @@ fn alert_discovery_payload(slug: &str, name: &str, ctx: &Ctx) -> String {
     payload.to_string()
 }
 
-// --- Areas (alarm_control_panel) ---
-
 // --- Area mode with the panel's names (select) ---
 
 fn area_mode_discovery_topic(area: &Area, ctx: &Ctx) -> String {
     format!("{}/select/{}/area_{}_mode/config", ctx.discovery_prefix, node_id(ctx), area.id)
 }
 
-fn area_mode_discovery_payload(area: &Area, mode_names: &ModeNames, ctx: &Ctx) -> String {
-    let prefix = ctx.topic_prefix;
-    let area_name = if area.name.is_empty() {
+fn area_name(area: &Area) -> String {
+    if area.name.is_empty() {
         format!("Area {}", area.id)
     } else {
         area.name.clone()
-    };
+    }
+}
+
+fn area_mode_discovery_payload(area: &Area, mode_names: &ModeNames, ctx: &Ctx) -> String {
+    let prefix = ctx.topic_prefix;
     let options: Vec<&str> = ModeNames::ORDER.iter().map(|&m| mode_names.label(m)).collect();
     let mut payload = json!({
-        "name": format!("{area_name} Mode"),
+        "name": format!("{} Mode", area_name(area)),
         "unique_id": format!("spc_{}_area_{}_mode", ctx.info.serial, area.id),
         "state_topic": format!("{prefix}/area/{}/mode", area.id),
         "command_topic": format!("{prefix}/area/{}/mode/set", area.id),
@@ -265,33 +271,20 @@ fn area_mode_discovery_payload(area: &Area, mode_names: &ModeNames, ctx: &Ctx) -
     payload.to_string()
 }
 
-fn area_discovery_topic(area: &Area, ctx: &Ctx) -> String {
-    format!(
-        "{}/alarm_control_panel/{}/area_{}/config",
-        ctx.discovery_prefix,
-        node_id(ctx),
-        area.id
-    )
+fn area_alarm_discovery_topic(area: &Area, ctx: &Ctx) -> String {
+    format!("{}/binary_sensor/{}/area_{}_alarm/config", ctx.discovery_prefix, node_id(ctx), area.id)
 }
 
-fn area_discovery_payload(area: &Area, ctx: &Ctx) -> String {
+/// Whether the area is in alarm; the mode select cannot show that.
+fn area_alarm_discovery_payload(area: &Area, ctx: &Ctx) -> String {
     let prefix = ctx.topic_prefix;
-    let name = if area.name.is_empty() {
-        format!("Area {}", area.id)
-    } else {
-        area.name.clone()
-    };
-
-    // Access control is left to Home Assistant and the panel's EDP
-    // receiver permissions; the panel takes no PIN over EDP.
     let mut payload = json!({
-        "name": name,
-        "unique_id": format!("spc_{}_area_{}", ctx.info.serial, area.id),
-        "state_topic": format!("{prefix}/area/{}/state", area.id),
-        "command_topic": format!("{prefix}/area/{}/set", area.id),
-        "supported_features": ["arm_home", "arm_night", "arm_away"],
-        "code_arm_required": false,
-        "code_disarm_required": false,
+        "name": format!("{} Alarm", area_name(area)),
+        "unique_id": format!("spc_{}_area_{}_alarm", ctx.info.serial, area.id),
+        "state_topic": format!("{prefix}/area/{}/alarm", area.id),
+        "payload_on": "ON",
+        "payload_off": "OFF",
+        "device_class": "safety",
         "device": device_info(ctx),
     });
     merge(&mut payload, &availability(ctx));

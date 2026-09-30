@@ -24,20 +24,8 @@ enum MqttEvent {
     Connected,
     Disconnected,
     HomeAssistantOnline,
-    AreaCommand { area_id: u8, payload: String },
     AreaModeCommand { area_id: u8, payload: String },
     ZoneCommand { zone_id: u8, control: ZoneControl, payload: String },
-}
-
-/// Home Assistant alarm_control_panel command payloads.
-fn alarm_panel_mode(payload: &str) -> Option<ArmMode> {
-    match payload {
-        "DISARM" => Some(ArmMode::Unset),
-        "ARM_HOME" => Some(ArmMode::PartSetA),
-        "ARM_NIGHT" => Some(ArmMode::PartSetB),
-        "ARM_AWAY" => Some(ArmMode::FullSet),
-        _ => None,
-    }
 }
 
 fn arm_op(mode: ArmMode) -> BinaryOp {
@@ -70,20 +58,6 @@ fn zone_op(control: ZoneControl, payload: &str) -> Option<BinaryOp> {
 
 fn on_off(on: bool) -> &'static str {
     if on { "ON" } else { "OFF" }
-}
-
-/// Home Assistant alarm_control_panel state payload.
-fn area_state(area: &Area) -> &'static str {
-    if area.triggered {
-        return "triggered";
-    }
-    match area.mode {
-        Some(ArmMode::Unset) => "disarmed",
-        Some(ArmMode::PartSetA) => "armed_home",
-        Some(ArmMode::PartSetB) => "armed_night",
-        Some(ArmMode::FullSet) => "armed_away",
-        None => "None",
-    }
 }
 
 fn zone_state(zone: &Zone) -> &'static str {
@@ -273,7 +247,6 @@ impl Bridge<'_> {
                 self.discovery.clear();
                 let prefix = &self.config.topic_prefix;
                 for topic in [
-                    format!("{prefix}/area/+/set"),
                     format!("{prefix}/area/+/mode/set"),
                     format!("{prefix}/zone/+/+/set"),
                     format!("{}/status", self.config.discovery_prefix),
@@ -289,10 +262,6 @@ impl Bridge<'_> {
                 info!("Home Assistant birth message received, re-publishing discovery");
                 self.discovery.clear();
                 self.publish_all().await;
-            }
-            MqttEvent::AreaCommand { area_id, payload } => {
-                let mode = alarm_panel_mode(&payload);
-                self.area_command(area_id, mode, &payload).await;
             }
             MqttEvent::AreaModeCommand { area_id, payload } => {
                 let mode = self.config.mode_names.mode(&payload);
@@ -444,7 +413,8 @@ impl Bridge<'_> {
     async fn publish_area(&self, id: u8) {
         let Some(area) = self.loaded().and_then(|l| l.snapshot.areas.get(&id)) else { return };
         let prefix = &self.config.topic_prefix;
-        self.publish(format!("{prefix}/area/{id}/state"), true, area_state(area).into()).await;
+        self.publish(format!("{prefix}/area/{id}/alarm"), true, on_off(area.triggered).into())
+            .await;
         let label = area_mode_label(area, &self.config.mode_names);
         self.publish(format!("{prefix}/area/{id}/mode"), true, label.into()).await;
     }
@@ -538,16 +508,11 @@ fn parse_zone_command(rest: &str, payload: String) -> Option<MqttEvent> {
     }
 }
 
-/// `<area id>` (alarm panel) or `<area id>/mode` (select) from a `.../area/…/set` topic.
+/// `<area id>/mode` from a `.../area/+/mode/set` topic.
 fn parse_area_command(rest: &str, payload: String) -> Option<MqttEvent> {
-    let (id, is_mode) = match rest.strip_suffix("/mode") {
-        Some(id) => (id, true),
-        None => (rest, false),
-    };
-    match id.parse::<u8>() {
-        Ok(area_id) if is_mode => Some(MqttEvent::AreaModeCommand { area_id, payload }),
-        Ok(area_id) => Some(MqttEvent::AreaCommand { area_id, payload }),
-        Err(_) => {
+    match rest.strip_suffix("/mode").map(str::parse::<u8>) {
+        Some(Ok(area_id)) => Some(MqttEvent::AreaModeCommand { area_id, payload }),
+        _ => {
             warn!("Ignoring area command on unrecognised topic suffix {rest:?}");
             None
         }
