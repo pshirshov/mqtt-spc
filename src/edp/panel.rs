@@ -396,6 +396,14 @@ fn parse_id<T: std::str::FromStr>(row: &Row, kind: &str) -> Option<T> {
 }
 
 impl Snapshot {
+    /// The mode shared by every area; `None` when they differ, when any is
+    /// unrecognised, or when there are no areas.
+    pub fn common_mode(&self) -> Option<ArmMode> {
+        let mut modes = self.areas.values().map(|a| a.mode);
+        let first = modes.next()??;
+        modes.all(|m| m == Some(first)).then_some(first)
+    }
+
     pub fn apply_areas(&mut self, reply: &XmlReply) {
         let mut areas = BTreeMap::new();
         for row in reply.rows("AREA_STATUS") {
@@ -575,6 +583,22 @@ mod tests {
         assert_eq!(unknown.unmapped_active(), vec![30]);
         let bad = parse_reply(br#"<COMMAND_REPLY><SYSALERT INPUT="zz" /></COMMAND_REPLY>"#).unwrap();
         assert!(s.apply_status(&bad).is_err());
+    }
+
+    #[test]
+    fn common_mode_requires_agreement() {
+        let areas = |xml: &str| {
+            let mut s = Snapshot::default();
+            s.apply_areas(
+                &parse_reply(format!("<COMMAND_REPLY><AREA_STATUS>{xml}</AREA_STATUS></COMMAND_REPLY>").as_bytes())
+                    .unwrap(),
+            );
+            s.common_mode()
+        };
+        assert_eq!(areas(r#"<AREA ID="1" MODE="3" /><AREA ID="2" MODE="3" />"#), Some(ArmMode::FullSet));
+        assert_eq!(areas(r#"<AREA ID="1" MODE="0" /><AREA ID="2" MODE="3" />"#), None);
+        assert_eq!(areas(r#"<AREA ID="1" MODE="9" /><AREA ID="2" MODE="9" />"#), None);
+        assert_eq!(areas(""), None);
     }
 
     fn zones(xml: &str) -> XmlReply {

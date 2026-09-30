@@ -123,6 +123,10 @@ pub enum BinaryOp {
     AreaPartSetB = 0x10,
 }
 
+/// Area command target addressing every area. Verified live (SPC4000,
+/// firmware 3.9.0) for full set and unset; 0xFF is rejected as invalid.
+pub const ALL_AREAS_TARGET: u8 = 0;
+
 type ReplyKey = (u8, u32);
 
 struct Shared {

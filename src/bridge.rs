@@ -8,12 +8,14 @@ use tracing::{error, info, warn};
 
 use crate::config::{Config, ModeNames};
 use crate::edp::panel::{
-    Area, ArmMode, PanelInfo, QUERY_AREAS, QUERY_INFO, QUERY_STATUS, QUERY_ZONES,
+    ArmMode, PanelInfo, QUERY_AREAS, QUERY_INFO, QUERY_STATUS, QUERY_ZONES,
     SYSTEM_ALERTS, Snapshot, Zone,
 };
-use crate::edp::session::{BinaryOp, CommandError, LinkEvent, SessionHandle, SessionId};
+use crate::edp::session::{ALL_AREAS_TARGET, BinaryOp, CommandError, LinkEvent, SessionHandle, SessionId};
 use crate::edp::sia::SiaEvent;
-use crate::mqtt::discovery::{self as ha, Ctx, UNMAPPED_ALERT_SLUG, ZoneControl};
+use crate::mqtt::discovery::{
+    self as ha, ALL_AREAS_TOPIC_ID, Ctx, UNMAPPED_ALERT_SLUG, ZoneControl,
+};
 
 const MQTT_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MQTT_KEEP_ALIVE: Duration = Duration::from_secs(30);
@@ -24,8 +26,15 @@ enum MqttEvent {
     Connected,
     Disconnected,
     HomeAssistantOnline,
-    AreaModeCommand { area_id: u8, payload: String },
+    AreaModeCommand { target: AreaTarget, payload: String },
     ZoneCommand { zone_id: u8, control: ZoneControl, payload: String },
+}
+
+/// Target of an area mode command: one area, or all of them at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AreaTarget {
+    One(u8),
+    All,
 }
 
 fn arm_op(mode: ArmMode) -> BinaryOp {
@@ -38,8 +47,8 @@ fn arm_op(mode: ArmMode) -> BinaryOp {
 }
 
 /// Select state: the panel's name for the mode.
-fn area_mode_label<'a>(area: &Area, names: &'a ModeNames) -> &'a str {
-    match area.mode {
+fn mode_label(mode: Option<ArmMode>, names: &ModeNames) -> &str {
+    match mode {
         Some(mode) => names.label(mode),
         None => "None",
     }
@@ -208,6 +217,7 @@ impl Bridge<'_> {
         for id in areas {
             self.publish_area(id).await;
         }
+        self.publish_all_areas_mode().await;
         if effect.refresh_alerts {
             self.publish_alerts().await;
         }
@@ -263,9 +273,8 @@ impl Bridge<'_> {
                 self.discovery.clear();
                 self.publish_all().await;
             }
-            MqttEvent::AreaModeCommand { area_id, payload } => {
-                let mode = self.config.mode_names.mode(&payload);
-                self.area_command(area_id, mode, &payload).await;
+            MqttEvent::AreaModeCommand { target, payload } => {
+                self.area_command(target, &payload).await;
             }
             MqttEvent::ZoneCommand { zone_id, control, payload } => {
                 let Some(op) = zone_op(control, &payload) else {
@@ -279,35 +288,98 @@ impl Bridge<'_> {
         }
     }
 
-    async fn area_command(&mut self, area_id: u8, mode: Option<ArmMode>, payload: &str) {
-        let Some(mode) = mode else {
-            warn!("Unsupported command {payload:?} for area {area_id}");
+    async fn area_command(&mut self, target: AreaTarget, payload: &str) {
+        let Some(mode) = self.config.mode_names.mode(payload) else {
+            warn!("Unsupported command {payload:?} for {target:?}");
             return;
         };
-        self.command(arm_op(mode), area_id, &format!("Area {area_id} {payload}")).await;
+        let ids = match target {
+            AreaTarget::One(id) => {
+                self.command(arm_op(mode), id, &format!("Area {id} {payload}")).await;
+                vec![id]
+            }
+            AreaTarget::All => self.all_areas_command(mode, payload).await,
+        };
         self.reread(QUERY_AREAS).await;
-        self.publish_area(area_id).await;
+        for id in ids {
+            self.publish_area(id).await;
+        }
+        self.publish_all_areas_mode().await;
+    }
+
+    /// Set every area to `mode` with the panel's all-areas target, all or
+    /// nothing: if the panel rejects the command, any area it changed anyway
+    /// is restored to its previous mode. Unset is not rolled back, since that
+    /// would re-arm areas around someone who just disarmed. Returns the areas
+    /// the command was meant to change.
+    async fn all_areas_command(&mut self, mode: ArmMode, payload: &str) -> Vec<u8> {
+        let Some(loaded) = self.loaded() else {
+            warn!("All areas {payload} dropped: panel not loaded");
+            return Vec::new();
+        };
+        let plan = match all_areas_plan(&loaded.snapshot, mode) {
+            Ok(plan) => plan,
+            Err(id) => {
+                self.report(format!(
+                    "All areas {payload} refused: area {id} is in an unrecognised mode, \
+                     so it could not be rolled back"
+                ))
+                .await;
+                return Vec::new();
+            }
+        };
+        if plan.is_empty() {
+            info!("All areas already {payload}");
+            return Vec::new();
+        }
+        let accepted =
+            self.command(arm_op(mode), ALL_AREAS_TARGET, &format!("All areas {payload}")).await;
+        if !accepted && mode != ArmMode::Unset {
+            self.reread(QUERY_AREAS).await;
+            let Some(loaded) = self.loaded() else { return Vec::new() };
+            let changed: Vec<(u8, ArmMode)> = plan
+                .iter()
+                .copied()
+                .filter(|&(id, previous)| {
+                    loaded.snapshot.areas.get(&id).is_some_and(|a| a.mode != Some(previous))
+                })
+                .collect();
+            for (id, previous) in changed {
+                let label = self.config.mode_names.label(previous).to_owned();
+                self.command(arm_op(previous), id, &format!("Area {id} rollback to {label}"))
+                    .await;
+            }
+        }
+        plan.into_iter().map(|(id, _)| id).collect()
     }
 
     /// Send a binary command; a failure is logged and surfaced on the event
     /// topic. The caller re-reads and re-publishes the state either way, so
-    /// Home Assistant drops any optimistic view.
-    async fn command(&mut self, op: BinaryOp, target: u8, what: &str) {
+    /// Home Assistant drops any optimistic view. Returns whether the panel
+    /// accepted the command.
+    async fn command(&mut self, op: BinaryOp, target: u8, what: &str) -> bool {
         let Some(link) = &self.link else {
             warn!("{what} dropped: panel not connected");
-            return;
+            return false;
         };
         info!("{what} -> {op:?}");
-        if let Err(e) = link.session.clone().binary_command(op, target).await {
-            error!("{what} failed: {e}");
-            let text = format!("{what} failed: {e}");
-            self.publish(
-                format!("{}/event", self.config.topic_prefix),
-                false,
-                json!({ "text": text }).to_string(),
-            )
-            .await;
+        match link.session.clone().binary_command(op, target).await {
+            Ok(()) => true,
+            Err(e) => {
+                self.report(format!("{what} failed: {e}")).await;
+                false
+            }
         }
+    }
+
+    async fn report(&self, text: String) {
+        error!("{text}");
+        self.publish(
+            format!("{}/event", self.config.topic_prefix),
+            false,
+            json!({ "text": text }).to_string(),
+        )
+        .await;
     }
 
     async fn reread(&mut self, query: &str) {
@@ -381,6 +453,7 @@ impl Bridge<'_> {
         for id in areas {
             self.publish_area(id).await;
         }
+        self.publish_all_areas_mode().await;
         for id in zones {
             self.publish_zone(id).await;
         }
@@ -415,8 +488,15 @@ impl Bridge<'_> {
         let prefix = &self.config.topic_prefix;
         self.publish(format!("{prefix}/area/{id}/alarm"), true, on_off(area.triggered).into())
             .await;
-        let label = area_mode_label(area, &self.config.mode_names);
+        let label = mode_label(area.mode, &self.config.mode_names);
         self.publish(format!("{prefix}/area/{id}/mode"), true, label.into()).await;
+    }
+
+    async fn publish_all_areas_mode(&self) {
+        let Some(loaded) = self.loaded() else { return };
+        let label = mode_label(loaded.snapshot.common_mode(), &self.config.mode_names);
+        let topic = format!("{}/area/{ALL_AREAS_TOPIC_ID}/mode", self.config.topic_prefix);
+        self.publish(topic, true, label.into()).await;
     }
 
     async fn publish_zone(&self, id: u32) {
@@ -495,6 +575,17 @@ async fn drive_eventloop(
     }
 }
 
+/// Areas an all-areas command changes, each with its current mode for
+/// rollback; `Err(area id)` if such an area's current mode is unrecognised.
+fn all_areas_plan(snapshot: &Snapshot, mode: ArmMode) -> Result<Vec<(u8, ArmMode)>, u8> {
+    snapshot
+        .areas
+        .values()
+        .filter(|a| a.mode != Some(mode))
+        .map(|a| a.mode.map(|previous| (a.id, previous)).ok_or(a.id))
+        .collect()
+}
+
 /// `<zone id>/<inhibit|isolate>` from a `.../zone/+/+/set` topic.
 fn parse_zone_command(rest: &str, payload: String) -> Option<MqttEvent> {
     let (id, control) = rest.split_once('/')?;
@@ -508,13 +599,63 @@ fn parse_zone_command(rest: &str, payload: String) -> Option<MqttEvent> {
     }
 }
 
-/// `<area id>/mode` from a `.../area/+/mode/set` topic.
+/// `<area id|all>/mode` from a `.../area/+/mode/set` topic.
 fn parse_area_command(rest: &str, payload: String) -> Option<MqttEvent> {
-    match rest.strip_suffix("/mode").map(str::parse::<u8>) {
-        Some(Ok(area_id)) => Some(MqttEvent::AreaModeCommand { area_id, payload }),
-        _ => {
+    let target = match rest.strip_suffix("/mode") {
+        Some(ALL_AREAS_TOPIC_ID) => Some(AreaTarget::All),
+        Some(id) => id.parse::<u8>().ok().map(AreaTarget::One),
+        None => None,
+    };
+    match target {
+        Some(target) => Some(MqttEvent::AreaModeCommand { target, payload }),
+        None => {
             warn!("Ignoring area command on unrecognised topic suffix {rest:?}");
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::edp::panel::Area;
+
+    fn target(rest: &str) -> Option<AreaTarget> {
+        match parse_area_command(rest, String::new()) {
+            Some(MqttEvent::AreaModeCommand { target, .. }) => Some(target),
+            _ => None,
+        }
+    }
+
+    fn snapshot(modes: &[(u8, Option<ArmMode>)]) -> Snapshot {
+        let mut s = Snapshot::default();
+        for &(id, mode) in modes {
+            s.areas.insert(id, Area { id, name: String::new(), mode, triggered: false });
+        }
+        s
+    }
+
+    #[test]
+    fn all_areas_plan_skips_areas_in_mode() {
+        let s = snapshot(&[(1, Some(ArmMode::FullSet)), (2, Some(ArmMode::PartSetA))]);
+        assert_eq!(all_areas_plan(&s, ArmMode::FullSet), Ok(vec![(2, ArmMode::PartSetA)]));
+        assert_eq!(
+            all_areas_plan(&s, ArmMode::Unset),
+            Ok(vec![(1, ArmMode::FullSet), (2, ArmMode::PartSetA)])
+        );
+    }
+
+    #[test]
+    fn all_areas_plan_refuses_unrestorable_area() {
+        let s = snapshot(&[(1, Some(ArmMode::Unset)), (2, None)]);
+        assert_eq!(all_areas_plan(&s, ArmMode::FullSet), Err(2));
+    }
+
+    #[test]
+    fn area_command_topics() {
+        assert_eq!(target("2/mode"), Some(AreaTarget::One(2)));
+        assert_eq!(target("all/mode"), Some(AreaTarget::All));
+        assert_eq!(target("x/mode"), None);
+        assert_eq!(target("2/state"), None);
     }
 }

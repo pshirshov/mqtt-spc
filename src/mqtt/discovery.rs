@@ -55,12 +55,17 @@ impl ZoneControl {
 /// Sensor for active SYSALERT bits that have no known name.
 pub const UNMAPPED_ALERT_SLUG: &str = "unmapped_alert";
 
+/// Area topic segment of the select that sets every area at once.
+pub const ALL_AREAS_TOPIC_ID: &str = "all";
+
 /// Discovery topics of entities published by the web-UI-based bridge that
 /// this version no longer provides; an empty retained payload removes them.
 const LEGACY_ZONE_BUTTONS: [&str; 2] = ["inhibit", "isolate"];
 /// Per-area entities of earlier versions: the web-UI select, and the
 /// alarm_control_panel that duplicated the mode select.
 const LEGACY_AREA_COMPONENTS: [&str; 2] = ["select", "alarm_control_panel"];
+/// The web-UI bridge's "All Areas" row, published as select `area_0`.
+const LEGACY_ALL_AREAS_OBJECT_ID: &str = "area_0";
 
 /// Retained discovery configs for the current snapshot: topic -> payload.
 /// An empty payload deletes the entity in Home Assistant.
@@ -88,6 +93,10 @@ pub fn discovery_messages(
         for component in LEGACY_AREA_COMPONENTS {
             out.insert(legacy_topic(ctx, component, &format!("area_{}", area.id)), String::new());
         }
+    }
+    out.insert(legacy_topic(ctx, "select", LEGACY_ALL_AREAS_OBJECT_ID), String::new());
+    if snapshot.areas.len() > 1 {
+        out.insert(all_areas_mode_discovery_topic(ctx), all_areas_mode_discovery_payload(mode_names, ctx));
     }
     for zone in snapshot.zones.values() {
         let class = zone_classes
@@ -255,13 +264,44 @@ fn area_name(area: &Area) -> String {
 }
 
 fn area_mode_discovery_payload(area: &Area, mode_names: &ModeNames, ctx: &Ctx) -> String {
+    mode_select_payload(
+        &format!("{} Mode", area_name(area)),
+        &format!("spc_{}_area_{}_mode", ctx.info.serial, area.id),
+        &area.id.to_string(),
+        mode_names,
+        ctx,
+    )
+}
+
+fn all_areas_mode_discovery_topic(ctx: &Ctx) -> String {
+    format!("{}/select/{}/all_areas_mode/config", ctx.discovery_prefix, node_id(ctx))
+}
+
+/// Sets every area to one mode with a single panel command.
+fn all_areas_mode_discovery_payload(mode_names: &ModeNames, ctx: &Ctx) -> String {
+    mode_select_payload(
+        "All Areas Mode",
+        &format!("spc_{}_all_areas_mode", ctx.info.serial),
+        ALL_AREAS_TOPIC_ID,
+        mode_names,
+        ctx,
+    )
+}
+
+fn mode_select_payload(
+    name: &str,
+    unique_id: &str,
+    topic_id: &str,
+    mode_names: &ModeNames,
+    ctx: &Ctx,
+) -> String {
     let prefix = ctx.topic_prefix;
     let options: Vec<&str> = ModeNames::ORDER.iter().map(|&m| mode_names.label(m)).collect();
     let mut payload = json!({
-        "name": format!("{} Mode", area_name(area)),
-        "unique_id": format!("spc_{}_area_{}_mode", ctx.info.serial, area.id),
-        "state_topic": format!("{prefix}/area/{}/mode", area.id),
-        "command_topic": format!("{prefix}/area/{}/mode/set", area.id),
+        "name": name,
+        "unique_id": unique_id,
+        "state_topic": format!("{prefix}/area/{topic_id}/mode"),
+        "command_topic": format!("{prefix}/area/{topic_id}/mode/set"),
         "options": options,
         "icon": "mdi:shield-home",
         "device": device_info(ctx),
