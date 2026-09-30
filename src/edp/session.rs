@@ -35,6 +35,9 @@ const COMMAND_QUIET_TIME: Duration = Duration::from_millis(100);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_XML_FRAGMENTS: usize = 64;
 const READ_BUF_LEN: usize = 4096;
+/// A connection must deliver a valid frame within this time to become the
+/// active panel session; the panel sends HELLO immediately after connecting.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const WRITE_QUEUE_LEN: usize = 256;
 /// SIA events buffered for the consumer before the oldest are dropped.
 pub const LINK_EVENT_QUEUE_LEN: usize = 1024;
@@ -274,9 +277,15 @@ impl SessionHandle {
     }
 }
 
-/// Accept panel connections forever. A new connection supersedes the
-/// previous one: the panel keeps a single link per receiver, so a fresh dial
-/// means the old socket is dead even if it has not timed out yet.
+/// The connection currently acting as the panel link, and how to stop it.
+type ActiveSlot = Arc<StdMutex<Option<(SessionId, oneshot::Sender<()>)>>>;
+
+/// Accept panel connections forever. A connection supersedes the active one
+/// once it delivers a valid frame addressed to this receiver: the panel keeps
+/// a single link per receiver, so a fresh dial means the old socket is dead
+/// even if it has not timed out yet. Requiring a valid frame first keeps a
+/// stray connection (or, with encryption, anyone without the key) from
+/// knocking the panel off.
 pub async fn run_receiver(
     config: ReceiverConfig,
     events: mpsc::Sender<LinkEvent>,
@@ -287,25 +296,22 @@ pub async fn run_receiver(
         config.receiver_id, config.listen
     );
     let next_id = AtomicU64::new(1);
-    let mut current: Option<(SessionId, oneshot::Sender<()>)> = None;
+    let active: ActiveSlot = Arc::new(StdMutex::new(None));
     loop {
         let (stream, peer) = listener.accept().await?;
         let id = SessionId(next_id.fetch_add(1, Ordering::Relaxed));
-        if let Some((old_id, supersede)) = current.take()
-            && supersede.send(()).is_ok()
-        {
-            warn!("Panel connection {id} from {peer} supersedes {old_id}");
-        }
-        info!("Panel connection {id} from {peer}");
-        let (supersede_tx, supersede_rx) = oneshot::channel();
-        tokio::spawn(run_session(
-            id,
-            stream,
-            config.clone(),
-            events.clone(),
-            supersede_rx,
-        ));
-        current = Some((id, supersede_tx));
+        info!("Connection {id} from {peer}");
+        tokio::spawn(run_session(id, stream, config.clone(), events.clone(), Arc::clone(&active)));
+    }
+}
+
+/// Make `id` the active panel link, stopping the previous one.
+fn claim(active: &ActiveSlot, id: SessionId, supersede: oneshot::Sender<()>) {
+    let previous = active.lock().unwrap().replace((id, supersede));
+    if let Some((old_id, old)) = previous
+        && old.send(()).is_ok()
+    {
+        warn!("Panel connection {id} supersedes {old_id}");
     }
 }
 
@@ -314,13 +320,28 @@ async fn run_session(
     stream: TcpStream,
     config: ReceiverConfig,
     events: mpsc::Sender<LinkEvent>,
-    mut superseded: oneshot::Receiver<()>,
+    active: ActiveSlot,
 ) {
     let (mut reader, writer) = stream.into_split();
     let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_LEN);
     let writer_task = tokio::spawn(write_loop(writer, write_rx));
+    let (supersede_tx, mut superseded) = oneshot::channel();
+    let mut unclaimed = Some(supersede_tx);
 
-    let result = read_loop(id, &mut reader, &config, write_tx, &events, &mut superseded).await;
+    let result = read_loop(
+        id,
+        &mut reader,
+        &config,
+        write_tx,
+        &events,
+        &mut superseded,
+        |id| {
+            if let Some(tx) = unclaimed.take() {
+                claim(&active, id, tx);
+            }
+        },
+    )
+    .await;
     writer_task.abort();
     match result {
         Ok(()) => info!("Panel connection {id} closed"),
@@ -345,6 +366,7 @@ async fn read_loop(
     write_tx: mpsc::Sender<Vec<u8>>,
     events: &mpsc::Sender<LinkEvent>,
     superseded: &mut oneshot::Receiver<()>,
+    mut claim: impl FnMut(SessionId),
 ) -> Result<(), String> {
     let mut decoder = FrameDecoder::new(config.key.clone());
     let mut buf = vec![0u8; READ_BUF_LEN];
@@ -352,12 +374,17 @@ async fn read_loop(
     let mut ready = false;
 
     let result = 'outer: loop {
+        let timeout = if shared.is_some() {
+            config.idle_timeout
+        } else {
+            HANDSHAKE_TIMEOUT.min(config.idle_timeout)
+        };
         let read = tokio::select! {
-            read = tokio::time::timeout(config.idle_timeout, reader.read(&mut buf)) => read,
+            read = tokio::time::timeout(timeout, reader.read(&mut buf)) => read,
             _ = &mut *superseded => break Err("superseded by a new panel connection".into()),
         };
         let n = match read {
-            Err(_) => break Err(format!("no data for {:?}", config.idle_timeout)),
+            Err(_) => break Err(format!("no valid data for {timeout:?}")),
             Ok(Err(e)) => break Err(e.to_string()),
             Ok(Ok(0)) => break Ok(()),
             Ok(Ok(n)) => n,
@@ -370,7 +397,14 @@ async fn read_loop(
             }
         };
         for frame in frames {
+            if shared.is_none() && frame.dst_id != config.receiver_id {
+                break 'outer Err(format!(
+                    "first frame is addressed to receiver {}, not {}",
+                    frame.dst_id, config.receiver_id
+                ));
+            }
             let sess = shared.get_or_insert_with(|| {
+                claim(id);
                 info!("Panel {} connected ({id})", frame.src_id);
                 Arc::new(Shared {
                     receiver_id: config.receiver_id,
