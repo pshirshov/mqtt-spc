@@ -11,6 +11,7 @@ use super::xml::{Row, XmlReply};
 pub const QUERY_INFO: &str = "info";
 pub const QUERY_AREAS: &str = "area_status";
 pub const QUERY_ZONES: &str = "zone_status";
+pub const QUERY_STATUS: &str = "status";
 
 /// Arm/disarm events do not reliably encode the mode, nor even the area
 /// (some firmware puts the user ID in the address): re-read `area_status`.
@@ -238,6 +239,42 @@ impl fmt::Display for ZoneType {
     }
 }
 
+/// ZONE_STATUS `STATUS`. Values 1 and 2 verified by inhibiting/isolating a
+/// zone on a live panel; others are passed through as their raw number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneStatus {
+    Normal,
+    Inhibited,
+    Isolated,
+    Other(u32),
+}
+
+impl ZoneStatus {
+    fn from_token(token: &str) -> Self {
+        match token.parse::<u32>() {
+            Ok(0) => Self::Normal,
+            Ok(1) => Self::Inhibited,
+            Ok(2) => Self::Isolated,
+            Ok(n) => Self::Other(n),
+            Err(_) => {
+                warn!("Zone has non-numeric STATUS {token:?}");
+                Self::Other(u32::MAX)
+            }
+        }
+    }
+}
+
+impl fmt::Display for ZoneStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Normal => f.write_str("normal"),
+            Self::Inhibited => f.write_str("inhibited"),
+            Self::Isolated => f.write_str("isolated"),
+            Self::Other(n) => write!(f, "status_{n}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Zone {
     pub id: u32,
@@ -245,6 +282,87 @@ pub struct Zone {
     pub area_id: u32,
     pub zone_type: Option<ZoneType>,
     pub input: ZoneInput,
+    pub status: ZoneStatus,
+    pub inhibit_allowed: bool,
+    pub isolate_allowed: bool,
+}
+
+/// A system alert and its bit in the `status` reply's SYSALERT masks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemAlertDef {
+    pub bit: u32,
+    /// Stable identifier; matches the web-UI-based bridge's sensor IDs.
+    pub slug: &'static str,
+    pub name: &'static str,
+}
+
+/// Measured on a live SPC4000 (firmware 3.9.0) by inhibiting each alert via
+/// the web UI and reading SYSALERT.INHIBIT. User Duress, User RF FOB Panic
+/// and Code Tamper cannot be inhibited, so their bits are unknown; the two
+/// wireless relearning alerts set no bit.
+pub const SYSTEM_ALERTS: [SystemAlertDef; 17] = [
+    SystemAlertDef { bit: 0, slug: "mains_fault", name: "Mains Fault" },
+    SystemAlertDef { bit: 1, slug: "battery_fault", name: "Battery Fault" },
+    SystemAlertDef { bit: 2, slug: "aux_fuse_fault", name: "Aux. Fuse Fault" },
+    SystemAlertDef { bit: 3, slug: "external_bell_fuse_fault", name: "External Bell Fuse Fault" },
+    SystemAlertDef { bit: 4, slug: "internal_bell_fuse_fault", name: "Internal Bell Fuse Fault" },
+    SystemAlertDef { bit: 5, slug: "bell_tamper", name: "Bell Tamper" },
+    SystemAlertDef { bit: 6, slug: "cabinet_tamper", name: "Cabinet Tamper" },
+    SystemAlertDef { bit: 7, slug: "aux_tamper_1", name: "Aux. Tamper 1" },
+    SystemAlertDef { bit: 8, slug: "aux_tamper_2", name: "Aux. Tamper 2" },
+    SystemAlertDef { bit: 9, slug: "antenna_tamper", name: "Antenna Tamper" },
+    SystemAlertDef { bit: 10, slug: "rf_jamming", name: "RF Jamming" },
+    SystemAlertDef { bit: 11, slug: "modem_1_fault", name: "Modem 1 Fault" },
+    SystemAlertDef { bit: 15, slug: "x-bus_cable_fault", name: "X-BUS Cable Fault" },
+    SystemAlertDef { bit: 16, slug: "fail_to_communicate", name: "Fail to Communicate" },
+    SystemAlertDef { bit: 21, slug: "psu_fault", name: "PSU Fault" },
+    SystemAlertDef { bit: 23, slug: "ethernet_link", name: "Ethernet Link" },
+    SystemAlertDef { bit: 24, slug: "network_fault", name: "Network Fault" },
+];
+
+/// SYSALERT bitmasks from the `status` reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SystemAlerts {
+    pub input: u32,
+    pub alert: u32,
+    pub inhibit: u32,
+    pub isolate: u32,
+}
+
+impl SystemAlerts {
+    pub fn from_reply(reply: &XmlReply) -> Result<Self, String> {
+        let row = reply.rows("SYSALERT").first().ok_or("status reply has no SYSALERT")?;
+        let mask = |k: &str| -> Result<u32, String> {
+            let v = row.get(k).ok_or_else(|| format!("SYSALERT has no {k}: {row:?}"))?;
+            u32::from_str_radix(v, 16).map_err(|e| format!("SYSALERT {k}={v:?}: {e}"))
+        };
+        Ok(Self {
+            input: mask("INPUT")?,
+            alert: mask("ALERT")?,
+            inhibit: mask("INHIBIT")?,
+            isolate: mask("ISOLATE")?,
+        })
+    }
+
+    /// The alert is in fault either at its input or as a latched alert.
+    pub fn is_active(&self, bit: u32) -> bool {
+        (self.input | self.alert) >> bit & 1 == 1
+    }
+
+    pub fn is_inhibited(&self, bit: u32) -> bool {
+        self.inhibit >> bit & 1 == 1
+    }
+
+    pub fn is_isolated(&self, bit: u32) -> bool {
+        self.isolate >> bit & 1 == 1
+    }
+
+    /// Active bits with no entry in [`SYSTEM_ALERTS`].
+    pub fn unmapped_active(&self) -> Vec<u32> {
+        (0..u32::BITS)
+            .filter(|&b| self.is_active(b) && !SYSTEM_ALERTS.iter().any(|d| d.bit == b))
+            .collect()
+    }
 }
 
 /// Which snapshot entries an event changed.
@@ -254,12 +372,15 @@ pub struct EventEffect {
     pub areas: Vec<u8>,
     /// The event cannot be applied locally; re-read `area_status`.
     pub refresh_areas: bool,
+    /// The event may concern a system alert; re-read `status`.
+    pub refresh_alerts: bool,
 }
 
 #[derive(Debug, Default)]
 pub struct Snapshot {
     pub areas: BTreeMap<u8, Area>,
     pub zones: BTreeMap<u32, Zone>,
+    pub alerts: SystemAlerts,
 }
 
 fn parse_id<T: std::str::FromStr>(row: &Row, kind: &str) -> Option<T> {
@@ -311,14 +432,28 @@ impl Snapshot {
                         area_id: get("AREA").parse().unwrap_or(0),
                         zone_type: ZoneType::from_token(get("TYPE")),
                         input: ZoneInput::from_token(get("INPUT")),
+                        status: ZoneStatus::from_token(get("STATUS")),
+                        inhibit_allowed: get("INHIBIT_ALLOWED") == "1",
+                        isolate_allowed: get("ISOLATE_ALLOWED") == "1",
                     },
                 ))
             })
             .collect();
     }
 
+    pub fn apply_status(&mut self, reply: &XmlReply) -> Result<(), String> {
+        self.alerts = SystemAlerts::from_reply(reply)?;
+        Ok(())
+    }
+
     /// Apply an event locally where it is unambiguous.
     pub fn apply_event(&mut self, ev: &SiaEvent) -> EventEffect {
+        let mut effect = self.apply_event_state(ev);
+        effect.refresh_alerts = ![ZONE_OPEN_CODE, ZONE_CLOSE_CODE].contains(&ev.code.as_str());
+        effect
+    }
+
+    fn apply_event_state(&mut self, ev: &SiaEvent) -> EventEffect {
         let code = ev.code.as_str();
         if AREA_REFRESH_CODES.contains(&code) {
             let mut effect = EventEffect {
@@ -384,8 +519,8 @@ mod tests {
         s.apply_zones(
             &parse_reply(
                 br#"<COMMAND_REPLY><ZONE_STATUS>
-                    <ZONE ID="1" ZONE_NAME="Front door" AREA="1" TYPE="1" INPUT="0" />
-                    <ZONE ID="2" ZONE_NAME="Hall PIR" AREA="1" TYPE="0" INPUT="7" />
+                    <ZONE ID="1" ZONE_NAME="Front door" AREA="1" TYPE="1" INPUT="0" STATUS="0" INHIBIT_ALLOWED="1" ISOLATE_ALLOWED="1" />
+                    <ZONE ID="2" ZONE_NAME="Hall PIR" AREA="1" TYPE="0" INPUT="7" STATUS="2" INHIBIT_ALLOWED="0" ISOLATE_ALLOWED="1" />
                     <ZONE ID="x" />
                 </ZONE_STATUS></COMMAND_REPLY>"#,
             )
@@ -406,6 +541,35 @@ mod tests {
         assert_eq!(s.zones[&1].zone_type, Some(ZoneType::EntryExit));
         assert_eq!(s.zones[&1].input.is_open(), Some(false));
         assert_eq!(s.zones[&2].input.is_open(), None);
+        assert_eq!(s.zones[&1].status, ZoneStatus::Normal);
+        assert_eq!(s.zones[&2].status, ZoneStatus::Isolated);
+        assert!(s.zones[&1].inhibit_allowed && !s.zones[&2].inhibit_allowed);
+    }
+
+    // Captured from the live panel, with the INHIBIT mask as observed while
+    // Bell Tamper (bit 5) and Ethernet link (bit 23) were inhibited.
+    const STATUS_REPLY: &[u8] = br#"<COMMAND_REPLY><SYSINFO TIME="09482630092026" ENGMODE="0" RF_TYPE="0" RF_VERSION="0" /><PSU BATT_VOLT="13.5V" AUX_VOLT="13.6V" AUX_CURR="100mA" AC_FREQ="50Hz" /><SYSALERT INPUT="00000000" ALERT="00000002" INHIBIT="00800020" ISOLATE="00000000" /><ETHERNETINFO FITTED="1" STATE="1" /></COMMAND_REPLY>"#;
+
+    #[test]
+    fn system_alert_masks() {
+        let mut s = snapshot();
+        s.apply_status(&parse_reply(STATUS_REPLY).unwrap()).unwrap();
+        assert!(s.alerts.is_active(1), "battery fault via ALERT mask");
+        assert!(!s.alerts.is_active(0));
+        assert!(s.alerts.is_inhibited(5) && s.alerts.is_inhibited(23));
+        assert!(s.alerts.unmapped_active().is_empty());
+        let unknown = SystemAlerts { input: 1 << 30, ..Default::default() };
+        assert_eq!(unknown.unmapped_active(), vec![30]);
+        let bad = parse_reply(br#"<COMMAND_REPLY><SYSALERT INPUT="zz" /></COMMAND_REPLY>"#).unwrap();
+        assert!(s.apply_status(&bad).is_err());
+    }
+
+    #[test]
+    fn alert_refresh_on_non_zone_events() {
+        let mut s = snapshot();
+        assert!(s.apply_event(&event("NR", "0")).refresh_alerts);
+        assert!(s.apply_event(&event("BA", "2")).refresh_alerts);
+        assert!(!s.apply_event(&event("ZO", "1")).refresh_alerts);
     }
 
     #[test]

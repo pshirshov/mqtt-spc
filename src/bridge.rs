@@ -8,11 +8,12 @@ use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::edp::panel::{
-    Area, ArmMode, PanelInfo, QUERY_AREAS, QUERY_INFO, QUERY_ZONES, Snapshot, Zone,
+    Area, ArmMode, PanelInfo, QUERY_AREAS, QUERY_INFO, QUERY_STATUS, QUERY_ZONES,
+    SYSTEM_ALERTS, Snapshot, Zone,
 };
-use crate::edp::session::{AreaOp, CommandError, LinkEvent, SessionHandle, SessionId};
+use crate::edp::session::{BinaryOp, CommandError, LinkEvent, SessionHandle, SessionId};
 use crate::edp::sia::SiaEvent;
-use crate::mqtt::discovery::{self as ha, Ctx};
+use crate::mqtt::discovery::{self as ha, Ctx, UNMAPPED_ALERT_SLUG, ZoneControl};
 
 const MQTT_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const MQTT_KEEP_ALIVE: Duration = Duration::from_secs(30);
@@ -24,17 +25,33 @@ enum MqttEvent {
     Disconnected,
     HomeAssistantOnline,
     AreaCommand { area_id: u8, payload: String },
+    ZoneCommand { zone_id: u8, control: ZoneControl, payload: String },
 }
 
 /// Home Assistant alarm_control_panel command payloads.
-fn area_op(payload: &str) -> Option<AreaOp> {
+fn area_op(payload: &str) -> Option<BinaryOp> {
     match payload {
-        "DISARM" => Some(AreaOp::Unset),
-        "ARM_HOME" => Some(AreaOp::PartSetA),
-        "ARM_NIGHT" => Some(AreaOp::PartSetB),
-        "ARM_AWAY" => Some(AreaOp::FullSet),
+        "DISARM" => Some(BinaryOp::AreaUnset),
+        "ARM_HOME" => Some(BinaryOp::AreaPartSetA),
+        "ARM_NIGHT" => Some(BinaryOp::AreaPartSetB),
+        "ARM_AWAY" => Some(BinaryOp::AreaFullSet),
         _ => None,
     }
+}
+
+/// Home Assistant switch command payloads.
+fn zone_op(control: ZoneControl, payload: &str) -> Option<BinaryOp> {
+    match (control, payload) {
+        (ZoneControl::Inhibit, "ON") => Some(BinaryOp::ZoneInhibit),
+        (ZoneControl::Inhibit, "OFF") => Some(BinaryOp::ZoneDeinhibit),
+        (ZoneControl::Isolate, "ON") => Some(BinaryOp::ZoneIsolate),
+        (ZoneControl::Isolate, "OFF") => Some(BinaryOp::ZoneDeisolate),
+        _ => None,
+    }
+}
+
+fn on_off(on: bool) -> &'static str {
+    if on { "ON" } else { "OFF" }
 }
 
 /// Home Assistant alarm_control_panel state payload.
@@ -173,6 +190,16 @@ impl Bridge<'_> {
         let Some(loaded) = &mut link.loaded else { return };
         let effect = loaded.snapshot.apply_event(&ev);
         let mut areas = effect.areas;
+        if effect.refresh_alerts {
+            match link.session.xml_query(QUERY_STATUS).await {
+                Ok(reply) => {
+                    if let Err(e) = loaded.snapshot.apply_status(&reply) {
+                        warn!("Bad status reply after event {}: {e}", ev.code);
+                    }
+                }
+                Err(e) => warn!("Status read after event {} failed: {e}", ev.code),
+            }
+        }
         if effect.refresh_areas {
             match link.session.xml_query(QUERY_AREAS).await {
                 Ok(reply) => {
@@ -189,6 +216,9 @@ impl Bridge<'_> {
         for id in areas {
             self.publish_area(id).await;
         }
+        if effect.refresh_alerts {
+            self.publish_alerts().await;
+        }
     }
 
     /// Initial load for a fresh session, or periodic reconciliation.
@@ -204,8 +234,10 @@ impl Bridge<'_> {
             let loaded = link.loaded.as_mut().expect("loaded above");
             let areas = link.session.xml_query(QUERY_AREAS).await?;
             let zones = link.session.xml_query(QUERY_ZONES).await?;
+            let status = link.session.xml_query(QUERY_STATUS).await?;
             loaded.snapshot.apply_areas(&areas);
             loaded.snapshot.apply_zones(&zones);
+            loaded.snapshot.apply_status(&status).map_err(CommandError::Protocol)?;
             Ok(())
         }
         .await;
@@ -224,6 +256,7 @@ impl Bridge<'_> {
                 let prefix = &self.config.topic_prefix;
                 for topic in [
                     format!("{prefix}/area/+/set"),
+                    format!("{prefix}/zone/+/+/set"),
                     format!("{}/status", self.config.discovery_prefix),
                 ] {
                     if let Err(e) = self.mqtt.subscribe(topic, QoS::AtLeastOnce).await {
@@ -239,44 +272,53 @@ impl Bridge<'_> {
                 self.publish_all().await;
             }
             MqttEvent::AreaCommand { area_id, payload } => {
-                self.area_command(area_id, &payload).await;
+                let Some(op) = area_op(&payload) else {
+                    warn!("Unsupported command {payload:?} for area {area_id}");
+                    return;
+                };
+                self.command(op, area_id, &format!("Area {area_id} {payload}")).await;
+                self.reread(QUERY_AREAS).await;
+                self.publish_area(area_id).await;
+            }
+            MqttEvent::ZoneCommand { zone_id, control, payload } => {
+                let Some(op) = zone_op(control, &payload) else {
+                    warn!("Unsupported {control:?} command {payload:?} for zone {zone_id}");
+                    return;
+                };
+                self.command(op, zone_id, &format!("Zone {zone_id} {control:?} {payload}")).await;
+                self.reread(QUERY_ZONES).await;
+                self.publish_zone(u32::from(zone_id)).await;
             }
         }
     }
 
-    async fn area_command(&mut self, area_id: u8, payload: &str) {
-        let Some(op) = area_op(payload) else {
-            warn!("Unsupported command {payload:?} for area {area_id}");
-            return;
-        };
+    /// Send a binary command; a failure is logged and surfaced on the event
+    /// topic. The caller re-reads and re-publishes the state either way, so
+    /// Home Assistant drops any optimistic view.
+    async fn command(&mut self, op: BinaryOp, target: u8, what: &str) {
         let Some(link) = &self.link else {
-            warn!("Area {area_id} command {payload} dropped: panel not connected");
+            warn!("{what} dropped: panel not connected");
             return;
         };
-        info!("Area {area_id}: {payload} -> {op:?}");
-        let session = link.session.clone();
-        match session.area_command(op, area_id).await {
-            Ok(()) => {
-                if let Some(Link { session, loaded: Some(loaded) }) = &mut self.link {
-                    match session.xml_query(QUERY_AREAS).await {
-                        Ok(reply) => loaded.snapshot.apply_areas(&reply),
-                        Err(e) => warn!("Area read after command failed: {e}"),
-                    }
-                }
-                self.publish_area(area_id).await;
-            }
-            Err(e) => {
-                error!("Area {area_id} {payload} failed: {e}");
-                let text = format!("Area {area_id} {payload} failed: {e}");
-                self.publish(
-                    format!("{}/event", self.config.topic_prefix),
-                    false,
-                    json!({ "text": text }).to_string(),
-                )
-                .await;
-                // Re-assert the actual state so HA drops its optimistic view.
-                self.publish_area(area_id).await;
-            }
+        info!("{what} -> {op:?}");
+        if let Err(e) = link.session.clone().binary_command(op, target).await {
+            error!("{what} failed: {e}");
+            let text = format!("{what} failed: {e}");
+            self.publish(
+                format!("{}/event", self.config.topic_prefix),
+                false,
+                json!({ "text": text }).to_string(),
+            )
+            .await;
+        }
+    }
+
+    async fn reread(&mut self, query: &str) {
+        let Some(Link { session, loaded: Some(loaded) }) = &mut self.link else { return };
+        match session.xml_query(query).await {
+            Ok(reply) if query == QUERY_AREAS => loaded.snapshot.apply_areas(&reply),
+            Ok(reply) => loaded.snapshot.apply_zones(&reply),
+            Err(e) => warn!("Re-read of {query} after command failed: {e}"),
         }
     }
 
@@ -340,6 +382,30 @@ impl Bridge<'_> {
         for id in zones {
             self.publish_zone(id).await;
         }
+        self.publish_alerts().await;
+    }
+
+    async fn publish_alerts(&self) {
+        let Some(loaded) = self.loaded() else { return };
+        let alerts = loaded.snapshot.alerts;
+        let prefix = &self.config.topic_prefix;
+        for def in &SYSTEM_ALERTS {
+            let topic = format!("{prefix}/system/{}", def.slug);
+            self.publish(topic.clone(), true, on_off(alerts.is_active(def.bit)).into()).await;
+            let attributes = json!({
+                "inhibited": alerts.is_inhibited(def.bit),
+                "isolated": alerts.is_isolated(def.bit),
+            });
+            self.publish(format!("{topic}/attributes"), true, attributes.to_string()).await;
+        }
+        let unmapped = alerts.unmapped_active();
+        if !unmapped.is_empty() {
+            warn!("Active system alert bits without a known name: {unmapped:?}");
+        }
+        let topic = format!("{prefix}/system/{UNMAPPED_ALERT_SLUG}");
+        self.publish(topic.clone(), true, on_off(!unmapped.is_empty()).into()).await;
+        self.publish(format!("{topic}/attributes"), true, json!({ "bits": unmapped }).to_string())
+            .await;
     }
 
     async fn publish_area(&self, id: u8) {
@@ -357,9 +423,20 @@ impl Bridge<'_> {
             "zone_type": zone.zone_type.map(|t| t.to_string()),
             "area_id": zone.area_id,
             "input": zone.input.to_string(),
+            "status": zone.status.to_string(),
         });
         self.publish(format!("{prefix}/zone/{id}/attributes"), true, attributes.to_string())
             .await;
+        for control in ZoneControl::ALL {
+            if control.available(zone) {
+                self.publish(
+                    format!("{prefix}/zone/{id}/{}", control.slug()),
+                    true,
+                    on_off(control.is_on(zone)).into(),
+                )
+                .await;
+            }
+        }
     }
 }
 
@@ -370,6 +447,7 @@ async fn drive_eventloop(
     discovery_prefix: String,
 ) {
     let area_prefix = format!("{prefix}/area/");
+    let zone_prefix = format!("{prefix}/zone/");
     let ha_status_topic = format!("{discovery_prefix}/status");
 
     loop {
@@ -391,6 +469,12 @@ async fn drive_eventloop(
                             None
                         }
                     }
+                } else if let Some(rest) = p
+                    .topic
+                    .strip_prefix(&zone_prefix)
+                    .and_then(|rest| rest.strip_suffix("/set"))
+                {
+                    parse_zone_command(rest, payload)
                 } else {
                     None
                 }
@@ -409,5 +493,18 @@ async fn drive_eventloop(
             && tx.send(ev).await.is_err() {
                 return;
             }
+    }
+}
+
+/// `<zone id>/<inhibit|isolate>` from a `.../zone/+/+/set` topic.
+fn parse_zone_command(rest: &str, payload: String) -> Option<MqttEvent> {
+    let (id, control) = rest.split_once('/')?;
+    let control = ZoneControl::ALL.into_iter().find(|c| c.slug() == control);
+    match (id.parse::<u8>(), control) {
+        (Ok(zone_id), Some(control)) => Some(MqttEvent::ZoneCommand { zone_id, control, payload }),
+        _ => {
+            warn!("Ignoring zone command on unrecognised topic suffix {rest:?}");
+            None
+        }
     }
 }

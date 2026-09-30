@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde_json::{json, Value};
 
-use crate::edp::panel::{Area, PanelInfo, Snapshot, Zone};
+use crate::edp::panel::{Area, PanelInfo, SYSTEM_ALERTS, Snapshot, Zone, ZoneStatus};
 
 /// Panel identity, passed through to all discovery payloads.
 pub struct Ctx<'a> {
@@ -10,6 +10,49 @@ pub struct Ctx<'a> {
     pub topic_prefix: &'a str,
     pub discovery_prefix: &'a str,
 }
+
+/// Zone bypass controls exposed as Home Assistant switches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneControl {
+    Inhibit,
+    Isolate,
+}
+
+impl ZoneControl {
+    pub const ALL: [ZoneControl; 2] = [ZoneControl::Inhibit, ZoneControl::Isolate];
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::Inhibit => "inhibit",
+            Self::Isolate => "isolate",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Inhibit => "Inhibit",
+            Self::Isolate => "Isolate",
+        }
+    }
+
+    /// The panel reports per zone whether the operation is permitted.
+    pub fn available(self, zone: &Zone) -> bool {
+        match self {
+            Self::Inhibit => zone.inhibit_allowed,
+            Self::Isolate => zone.isolate_allowed,
+        }
+    }
+
+    pub fn is_on(self, zone: &Zone) -> bool {
+        match self {
+            Self::Inhibit => zone.status == ZoneStatus::Inhibited,
+            Self::Isolate => zone.status == ZoneStatus::Isolated,
+        }
+    }
+}
+
+/// Sensor for active SYSALERT bits that have no known name.
+pub const UNMAPPED_ALERT_SLUG: &str = "unmapped_alert";
 
 /// Discovery topics of entities published by the web-UI-based bridge that
 /// this version no longer provides; an empty retained payload removes them.
@@ -24,6 +67,13 @@ pub fn discovery_messages(
 ) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     out.insert(event_sensor_discovery_topic(ctx), event_sensor_discovery_payload(ctx));
+    for def in &SYSTEM_ALERTS {
+        out.insert(alert_discovery_topic(def.slug, ctx), alert_discovery_payload(def.slug, def.name, ctx));
+    }
+    out.insert(
+        alert_discovery_topic(UNMAPPED_ALERT_SLUG, ctx),
+        alert_discovery_payload(UNMAPPED_ALERT_SLUG, "Unmapped System Alert", ctx),
+    );
     for area in snapshot.areas.values() {
         out.insert(area_discovery_topic(area, ctx), area_discovery_payload(area, ctx));
         out.insert(legacy_topic(ctx, "select", &format!("area_{}", area.id)), String::new());
@@ -35,6 +85,12 @@ pub fn discovery_messages(
             .or_else(|| zone.zone_type.map(|t| t.device_class()))
             .unwrap_or("opening");
         out.insert(zone_discovery_topic(zone, ctx), zone_discovery_payload(zone, class, ctx));
+        for control in ZoneControl::ALL.into_iter().filter(|c| c.available(zone)) {
+            out.insert(
+                zone_switch_discovery_topic(zone, control, ctx),
+                zone_switch_discovery_payload(zone, control, ctx),
+            );
+        }
         for action in LEGACY_ZONE_BUTTONS {
             out.insert(
                 legacy_topic(ctx, "button", &format!("zone_{}_{action}", zone.id)),
@@ -107,6 +163,65 @@ fn zone_discovery_payload(zone: &Zone, device_class: &str, ctx: &Ctx) -> String 
         "payload_off": "OFF",
         "json_attributes_topic": format!("{prefix}/zone/{}/attributes", zone.id),
         "device_class": device_class,
+        "device": device_info(ctx),
+    });
+    merge(&mut payload, &availability(ctx));
+
+    payload.to_string()
+}
+
+// --- Zone inhibit/isolate (switch) ---
+
+fn zone_switch_discovery_topic(zone: &Zone, control: ZoneControl, ctx: &Ctx) -> String {
+    format!(
+        "{}/switch/{}/zone_{}_{}/config",
+        ctx.discovery_prefix,
+        node_id(ctx),
+        zone.id,
+        control.slug()
+    )
+}
+
+fn zone_switch_discovery_payload(zone: &Zone, control: ZoneControl, ctx: &Ctx) -> String {
+    let prefix = ctx.topic_prefix;
+    let zone_name = if zone.name.is_empty() {
+        format!("Zone {}", zone.id)
+    } else {
+        zone.name.clone()
+    };
+    let mut payload = json!({
+        "name": format!("{zone_name} {}", control.label()),
+        "unique_id": format!("spc_{}_zone_{}_{}", ctx.info.serial, zone.id, control.slug()),
+        "state_topic": format!("{prefix}/zone/{}/{}", zone.id, control.slug()),
+        "command_topic": format!("{prefix}/zone/{}/{}/set", zone.id, control.slug()),
+        "payload_on": "ON",
+        "payload_off": "OFF",
+        "entity_category": "config",
+        "icon": "mdi:shield-off-outline",
+        "device": device_info(ctx),
+    });
+    merge(&mut payload, &availability(ctx));
+
+    payload.to_string()
+}
+
+// --- System alerts (binary_sensor, problem) ---
+
+fn alert_discovery_topic(slug: &str, ctx: &Ctx) -> String {
+    format!("{}/binary_sensor/{}/{slug}/config", ctx.discovery_prefix, node_id(ctx))
+}
+
+fn alert_discovery_payload(slug: &str, name: &str, ctx: &Ctx) -> String {
+    let prefix = ctx.topic_prefix;
+    let mut payload = json!({
+        "name": name,
+        "unique_id": format!("spc_{}_{slug}", ctx.info.serial),
+        "state_topic": format!("{prefix}/system/{slug}"),
+        "json_attributes_topic": format!("{prefix}/system/{slug}/attributes"),
+        "payload_on": "ON",
+        "payload_off": "OFF",
+        "device_class": "problem",
+        "entity_category": "diagnostic",
         "device": device_info(ctx),
     });
     merge(&mut payload, &availability(ctx));

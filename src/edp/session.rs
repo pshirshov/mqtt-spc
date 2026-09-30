@@ -106,13 +106,18 @@ fn reply_message(code: u8) -> &'static str {
     }
 }
 
-/// Area arm/disarm opcodes (major 4; payload: opcode, area ID, 0).
+/// Targeted binary commands (major 4; payload: opcode, target ID, 0).
+/// All verified against a live SPC4000, firmware 3.9.0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AreaOp {
-    FullSet = 0x01,
-    Unset = 0x02,
-    PartSetA = 0x0F,
-    PartSetB = 0x10,
+pub enum BinaryOp {
+    AreaFullSet = 0x01,
+    AreaUnset = 0x02,
+    ZoneInhibit = 0x03,
+    ZoneDeinhibit = 0x04,
+    ZoneIsolate = 0x09,
+    ZoneDeisolate = 0x0A,
+    AreaPartSetA = 0x0F,
+    AreaPartSetB = 0x10,
 }
 
 type ReplyKey = (u8, u32);
@@ -203,11 +208,11 @@ impl SessionHandle {
         )))
     }
 
-    pub async fn area_command(&self, op: AreaOp, area_id: u8) -> Result<(), CommandError> {
-        let label = format!("{op:?} area {area_id}");
+    pub async fn binary_command(&self, op: BinaryOp, target: u8) -> Result<(), CommandError> {
+        let label = format!("{op:?} {target}");
         let _guard = self.shared.command_lock.lock().await;
         let reply = self
-            .transact(major::BINARY_CMD, vec![op as u8, area_id, 0], &label)
+            .transact(major::BINARY_CMD, vec![op as u8, target, 0], &label)
             .await?;
         match reply.first() {
             Some(&REPLY_OK) => Ok(()),
