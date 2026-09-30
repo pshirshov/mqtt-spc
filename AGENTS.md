@@ -1,6 +1,7 @@
 # SPC-MQTT Bridge
 
 Vanderbilt SPC4300 alarm panel to MQTT bridge for Home Assistant integration.
+The panel connects to this bridge as an EDP v2 receiver (protocol per https://github.com/imduffy15/spcedp).
 
 ## Build
 
@@ -18,4 +19,4 @@ After changing `Cargo.toml` dependencies, you **must** update `cargoHash` in `fl
 
 ## Credentials
 
-Never read credential files (`creds.json`, `mqtt-creds.json`) directly. Only write code that reads them at runtime.
+Never read credential files (`mqtt-creds.json`, the EDP key file passed via `--edp-key-file`) directly. Only write code that reads them at runtime.

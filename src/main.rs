@@ -1,13 +1,14 @@
 mod bridge;
 mod config;
-mod model;
+mod edp;
 mod mqtt;
-mod spc;
-
-use std::path::Path;
 
 use clap::Parser;
+use tokio::sync::mpsc;
+use tracing::error;
 use tracing_subscriber::EnvFilter;
+
+use edp::session::LINK_EVENT_QUEUE_LEN;
 
 #[tokio::main]
 async fn main() {
@@ -17,12 +18,17 @@ async fn main() {
         )
         .init();
 
-    let args = config::Args::parse();
-    let spc_creds_path = args.spc_creds.clone();
-    let config = config::Config::from_args(args);
+    let config = config::Config::from_args(config::Args::parse());
 
-    let creds = config::Credentials::load(Path::new(&spc_creds_path));
-    let spc = spc::client::SpcClient::new(&config.spc_url, &creds);
+    let (link_tx, link_rx) = mpsc::channel(LINK_EVENT_QUEUE_LEN);
+    let receiver_config = config.receiver.clone();
+    let receiver = tokio::spawn(async move {
+        if let Err(e) = edp::session::run_receiver(receiver_config, link_tx).await {
+            error!("EDP receiver failed: {e}");
+        }
+    });
 
-    bridge::run(&config, spc).await;
+    bridge::run(&config, link_rx).await;
+    receiver.abort();
+    std::process::exit(1);
 }

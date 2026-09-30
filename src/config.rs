@@ -1,18 +1,35 @@
 use clap::Parser;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::Path;
+use std::time::Duration;
+
+use crate::edp::session::ReceiverConfig;
+use crate::edp::wire::EdpKey;
 
 #[derive(Debug, Parser)]
-#[command(about = "SPC alarm panel to MQTT bridge for Home Assistant")]
+#[command(about = "SPC alarm panel (EDP) to MQTT bridge for Home Assistant")]
 pub struct Args {
-    /// SPC panel base URL
-    #[arg(long)]
-    pub spc_url: String,
+    /// Address to accept the panel's EDP connection on
+    #[arg(long, default_value = "0.0.0.0:50000")]
+    pub listen: SocketAddr,
 
-    /// Path to SPC credentials JSON ({"login": "...", "password": "..."})
-    #[arg(long, default_value = "creds.json")]
-    pub spc_creds: String,
+    /// EDP receiver ID, as configured for this receiver on the panel
+    #[arg(long)]
+    pub receiver_id: u32,
+
+    /// File holding the receiver's 32-hex-digit EDP AES key (omit for unencrypted EDP)
+    #[arg(long)]
+    pub edp_key_file: Option<String>,
+
+    /// Drop the panel connection after this many seconds without traffic
+    #[arg(long, default_value_t = 120)]
+    pub idle_timeout: u64,
+
+    /// Full area/zone re-read interval in seconds (covers missed or unreported events)
+    #[arg(long, default_value_t = 30)]
+    pub refresh_interval: u64,
 
     /// MQTT broker host
     #[arg(long)]
@@ -33,10 +50,6 @@ pub struct Args {
     /// Home Assistant discovery prefix
     #[arg(long, default_value = "homeassistant")]
     pub discovery_prefix: String,
-
-    /// Poll interval in seconds
-    #[arg(long, default_value_t = 5)]
-    pub poll_interval: u64,
 
     /// Zone device class overrides (e.g. 1=door 2=motion)
     #[arg(long = "zone-class", value_parser = parse_zone_class)]
@@ -68,8 +81,8 @@ impl Credentials {
 
 #[derive(Debug)]
 pub struct Config {
-    pub spc_url: String,
-    pub poll_interval_secs: u64,
+    pub receiver: ReceiverConfig,
+    pub refresh_interval: Duration,
     pub mqtt_host: String,
     pub mqtt_port: u16,
     pub mqtt_creds: Option<Credentials>,
@@ -80,8 +93,11 @@ pub struct Config {
 
 impl Config {
     pub fn from_args(args: Args) -> Self {
-        let spc_creds = Path::new(&args.spc_creds);
-        assert!(spc_creds.is_file(), "SPC credentials not found: {}", args.spc_creds);
+        let key = args.edp_key_file.as_ref().map(|path| {
+            let hex = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("failed to read EDP key {path}: {e}"));
+            EdpKey::from_hex(&hex).unwrap_or_else(|e| panic!("invalid EDP key in {path}: {e}"))
+        });
 
         let mqtt_creds_path = Path::new(&args.mqtt_creds);
         let mqtt_creds = if mqtt_creds_path.is_file() {
@@ -91,8 +107,13 @@ impl Config {
         };
 
         Config {
-            spc_url: args.spc_url,
-            poll_interval_secs: args.poll_interval,
+            receiver: ReceiverConfig {
+                listen: args.listen,
+                receiver_id: args.receiver_id,
+                key,
+                idle_timeout: Duration::from_secs(args.idle_timeout),
+            },
+            refresh_interval: Duration::from_secs(args.refresh_interval),
             mqtt_host: args.mqtt_host,
             mqtt_port: args.mqtt_port,
             mqtt_creds,

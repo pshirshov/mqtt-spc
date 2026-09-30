@@ -1,27 +1,63 @@
+use std::collections::{BTreeMap, HashMap};
+
 use serde_json::{json, Value};
 
-use crate::model::{Area, Zone};
+use crate::edp::panel::{Area, PanelInfo, Snapshot, Zone};
 
 /// Panel identity, passed through to all discovery payloads.
 pub struct Ctx<'a> {
-    pub name: &'a str,
-    pub serial: &'a str,
+    pub info: &'a PanelInfo,
     pub topic_prefix: &'a str,
     pub discovery_prefix: &'a str,
 }
 
+/// Discovery topics of entities published by the web-UI-based bridge that
+/// this version no longer provides; an empty retained payload removes them.
+const LEGACY_ZONE_BUTTONS: [&str; 2] = ["inhibit", "isolate"];
+
+/// Retained discovery configs for the current snapshot: topic -> payload.
+/// An empty payload deletes the entity in Home Assistant.
+pub fn discovery_messages(
+    snapshot: &Snapshot,
+    ctx: &Ctx,
+    zone_classes: &HashMap<u32, String>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    out.insert(event_sensor_discovery_topic(ctx), event_sensor_discovery_payload(ctx));
+    for area in snapshot.areas.values() {
+        out.insert(area_discovery_topic(area, ctx), area_discovery_payload(area, ctx));
+        out.insert(legacy_topic(ctx, "select", &format!("area_{}", area.id)), String::new());
+    }
+    for zone in snapshot.zones.values() {
+        let class = zone_classes
+            .get(&zone.id)
+            .map(String::as_str)
+            .or_else(|| zone.zone_type.map(|t| t.device_class()))
+            .unwrap_or("opening");
+        out.insert(zone_discovery_topic(zone, ctx), zone_discovery_payload(zone, class, ctx));
+        for action in LEGACY_ZONE_BUTTONS {
+            out.insert(
+                legacy_topic(ctx, "button", &format!("zone_{}_{action}", zone.id)),
+                String::new(),
+            );
+        }
+    }
+    out
+}
+
 fn device_info(ctx: &Ctx) -> Value {
     json!({
-        "identifiers": [format!("spc_{}", ctx.serial)],
-        "name": ctx.name,
+        "identifiers": [format!("spc_{}", ctx.info.serial)],
+        "name": ctx.info.model,
         "manufacturer": "Vanderbilt",
-        "model": ctx.name,
-        "serial_number": ctx.serial,
+        "model": ctx.info.model,
+        "serial_number": ctx.info.serial,
+        "sw_version": ctx.info.firmware,
     })
 }
 
 fn node_id(ctx: &Ctx) -> String {
-    format!("spc_{}", ctx.serial)
+    format!("spc_{}", ctx.info.serial)
 }
 
 fn availability(ctx: &Ctx) -> Value {
@@ -40,9 +76,13 @@ fn merge(base: &mut Value, extra: &Value) {
     }
 }
 
+fn legacy_topic(ctx: &Ctx, component: &str, object_id: &str) -> String {
+    format!("{}/{component}/{}/{object_id}/config", ctx.discovery_prefix, node_id(ctx))
+}
+
 // --- Zones (binary_sensor) ---
 
-pub fn zone_discovery_topic(zone: &Zone, ctx: &Ctx) -> String {
+fn zone_discovery_topic(zone: &Zone, ctx: &Ctx) -> String {
     format!(
         "{}/binary_sensor/{}/zone_{}/config",
         ctx.discovery_prefix,
@@ -51,7 +91,7 @@ pub fn zone_discovery_topic(zone: &Zone, ctx: &Ctx) -> String {
     )
 }
 
-pub fn zone_discovery_payload(zone: &Zone, ctx: &Ctx) -> String {
+fn zone_discovery_payload(zone: &Zone, device_class: &str, ctx: &Ctx) -> String {
     let prefix = ctx.topic_prefix;
     let name = if zone.name.is_empty() {
         format!("Zone {}", zone.id)
@@ -61,34 +101,31 @@ pub fn zone_discovery_payload(zone: &Zone, ctx: &Ctx) -> String {
 
     let mut payload = json!({
         "name": name,
-        "unique_id": format!("spc_{}_zone_{}", ctx.serial, zone.id),
+        "unique_id": format!("spc_{}_zone_{}", ctx.info.serial, zone.id),
         "state_topic": format!("{prefix}/zone/{}/state", zone.id),
         "payload_on": "ON",
         "payload_off": "OFF",
         "json_attributes_topic": format!("{prefix}/zone/{}/attributes", zone.id),
+        "device_class": device_class,
         "device": device_info(ctx),
     });
     merge(&mut payload, &availability(ctx));
 
-    if !zone.device_class.is_empty() {
-        payload["device_class"] = json!(zone.device_class);
-    }
-
     payload.to_string()
 }
 
-// --- Areas (select) ---
+// --- Areas (alarm_control_panel) ---
 
-pub fn area_discovery_topic(area: &Area, ctx: &Ctx) -> String {
+fn area_discovery_topic(area: &Area, ctx: &Ctx) -> String {
     format!(
-        "{}/select/{}/area_{}/config",
+        "{}/alarm_control_panel/{}/area_{}/config",
         ctx.discovery_prefix,
         node_id(ctx),
         area.id
     )
 }
 
-pub fn area_discovery_payload(area: &Area, ctx: &Ctx) -> String {
+fn area_discovery_payload(area: &Area, ctx: &Ctx) -> String {
     let prefix = ctx.topic_prefix;
     let name = if area.name.is_empty() {
         format!("Area {}", area.id)
@@ -96,46 +133,16 @@ pub fn area_discovery_payload(area: &Area, ctx: &Ctx) -> String {
         area.name.clone()
     };
 
-    let options = area.select_options();
-
+    // Access control is left to Home Assistant and the panel's EDP
+    // receiver permissions; the panel takes no PIN over EDP.
     let mut payload = json!({
         "name": name,
-        "unique_id": format!("spc_{}_area_{}", ctx.serial, area.id),
+        "unique_id": format!("spc_{}_area_{}", ctx.info.serial, area.id),
         "state_topic": format!("{prefix}/area/{}/state", area.id),
         "command_topic": format!("{prefix}/area/{}/set", area.id),
-        "options": options,
-        "icon": "mdi:shield-home",
-        "device": device_info(ctx),
-    });
-    merge(&mut payload, &availability(ctx));
-
-    payload.to_string()
-}
-
-// --- System sensors (binary_sensor with problem class) ---
-
-pub fn system_sensor_discovery_topic(sensor_id: &str, ctx: &Ctx) -> String {
-    format!(
-        "{}/binary_sensor/{}/{sensor_id}/config",
-        ctx.discovery_prefix,
-        node_id(ctx),
-    )
-}
-
-pub fn system_sensor_discovery_payload(
-    sensor_id: &str,
-    name: &str,
-    state_topic: &str,
-    ctx: &Ctx,
-) -> String {
-    let mut payload = json!({
-        "name": name,
-        "unique_id": format!("spc_{}_{sensor_id}", ctx.serial),
-        "state_topic": state_topic,
-        "payload_on": "ON",
-        "payload_off": "OFF",
-        "device_class": "problem",
-        "entity_category": "diagnostic",
+        "supported_features": ["arm_home", "arm_night", "arm_away"],
+        "code_arm_required": false,
+        "code_disarm_required": false,
         "device": device_info(ctx),
     });
     merge(&mut payload, &availability(ctx));
@@ -145,7 +152,7 @@ pub fn system_sensor_discovery_payload(
 
 // --- Event log sensor ---
 
-pub fn event_sensor_discovery_topic(ctx: &Ctx) -> String {
+fn event_sensor_discovery_topic(ctx: &Ctx) -> String {
     format!(
         "{}/sensor/{}/last_event/config",
         ctx.discovery_prefix,
@@ -153,11 +160,11 @@ pub fn event_sensor_discovery_topic(ctx: &Ctx) -> String {
     )
 }
 
-pub fn event_sensor_discovery_payload(ctx: &Ctx) -> String {
+fn event_sensor_discovery_payload(ctx: &Ctx) -> String {
     let prefix = ctx.topic_prefix;
     let mut payload = json!({
         "name": "Last Event",
-        "unique_id": format!("spc_{}_last_event", ctx.serial),
+        "unique_id": format!("spc_{}_last_event", ctx.info.serial),
         "state_topic": format!("{prefix}/event"),
         "value_template": "{{ value_json.text[:255] }}",
         "json_attributes_topic": format!("{prefix}/event"),
@@ -167,74 +174,4 @@ pub fn event_sensor_discovery_payload(ctx: &Ctx) -> String {
     merge(&mut payload, &availability(ctx));
 
     payload.to_string()
-}
-
-// --- Zone action buttons (inhibit/isolate) ---
-
-pub fn zone_button_discovery_topic(zone: &Zone, action: &str, ctx: &Ctx) -> String {
-    format!(
-        "{}/button/{}/zone_{}_{action}/config",
-        ctx.discovery_prefix,
-        node_id(ctx),
-        zone.id,
-    )
-}
-
-pub fn zone_button_discovery_payload(zone: &Zone, action: &str, ctx: &Ctx) -> String {
-    let prefix = ctx.topic_prefix;
-    let name = if zone.name.is_empty() {
-        format!("Zone {} {}", zone.id, capitalize(action))
-    } else {
-        format!("{} {}", zone.name, capitalize(action))
-    };
-
-    let mut payload = json!({
-        "name": name,
-        "unique_id": format!("spc_{}_zone_{}_{action}", ctx.serial, zone.id),
-        "command_topic": format!("{prefix}/zone/{}/action", zone.id),
-        "payload_press": action,
-        "entity_category": "config",
-        "device": device_info(ctx),
-    });
-    merge(&mut payload, &availability(ctx));
-
-    payload.to_string()
-}
-
-// --- Alert action buttons (inhibit/isolate) ---
-
-pub fn alert_button_discovery_topic(sensor_id: &str, action: &str, ctx: &Ctx) -> String {
-    format!(
-        "{}/button/{}/{sensor_id}_{action}/config",
-        ctx.discovery_prefix,
-        node_id(ctx),
-    )
-}
-
-pub fn alert_button_discovery_payload(
-    sensor_id: &str,
-    alert_name: &str,
-    action: &str,
-    ctx: &Ctx,
-) -> String {
-    let prefix = ctx.topic_prefix;
-    let mut payload = json!({
-        "name": format!("{alert_name} {}", capitalize(action)),
-        "unique_id": format!("spc_{}_{sensor_id}_{action}", ctx.serial),
-        "command_topic": format!("{prefix}/alert/{sensor_id}/action"),
-        "payload_press": action,
-        "entity_category": "config",
-        "device": device_info(ctx),
-    });
-    merge(&mut payload, &availability(ctx));
-
-    payload.to_string()
-}
-
-fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_uppercase().to_string() + c.as_str(),
-    }
 }

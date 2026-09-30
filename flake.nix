@@ -27,9 +27,9 @@
       packages = forAllSystems ({ pkgs }: {
         default = pkgs.rustPlatform.buildRustPackage {
           pname = "spc-mqtt";
-          version = "0.1.0";
+          version = "0.2.0";
           src = ./.;
-          cargoHash = "sha256-Vo2HKwDtXBkNWjbZT7ZG+qUt8OCWOLeHsYyEpYCXtEg=";
+          cargoHash = "sha256-hf7hWo8FsFGWESP1Ksf6jlZ0MkThGRbWkrfCsO0MVKE=";
         };
       });
     };
